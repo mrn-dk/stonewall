@@ -1,87 +1,272 @@
-/* Global theme + accessibility: light/dark, visible focus, AA contrast. */
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+/* ---------------------------------------------------------------------------
+ * Stonewall dashboard token layer.
+ *
+ * Two layers live here:
+ *   1. shadcn's contract variables (--background, --foreground, --primary, …),
+ *      so the components under $lib/components/ui work unmodified.
+ *   2. Stonewall's domain semantics (agent-state and diff colors) that shadcn
+ *      has no concept of.
+ * Both are declared once per theme so a state pill and a shadcn Badge cannot
+ * drift apart.
+ *
+ * Dark mode is driven by data-theme on <html>, set before first paint by the
+ * inline script in app.html and owned thereafter by $lib/theme.svelte.js. The
+ * attribute is always present and always resolved (never "system"), so the
+ * variant below is the single switch for the whole stylesheet.
+ * ------------------------------------------------------------------------- */
+
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/* Contrast audit — WCAG 2.1 AA, computed not eyeballed (normal text needs
+ * 4.5:1). Each foreground is checked against BOTH surfaces it appears on:
+ * the page background and the muted/card panel, because a token that passes
+ * on white can fail on a panel.
+ *
+ *   light                              on bg     on panel
+ *   foreground        / background     19.79:1   —
+ *   muted-foreground  / background      5.28:1    4.84:1
+ *   state-running     / background      5.32:1    4.88:1
+ *   state-pending     / background      5.61:1    5.15:1
+ *   state-terminal    / background      5.69:1    5.22:1
+ *   state-failed      / background      5.43:1    4.98:1
+ *   state-parked      = muted-foreground
+ *
+ *   dark                               on bg     on card
+ *   foreground        / background     18.96:1   —
+ *   muted-foreground  / background      7.63:1    6.91:1
+ *   state-running     / background      9.47:1    8.57:1
+ *   state-pending     / background     10.4 :1    9.46:1
+ *   state-terminal    / background      7.98:1    7.26:1
+ *   state-failed      / background      6.84:1    6.19:1
+ *
+ * The focus ring is held to the 3:1 non-text floor instead: 4.28:1 light,
+ * 4.18:1 dark. Re-check every pair with `node scripts/contrast.mjs` after
+ * editing any value below — it exits non-zero on a regression. */
+
 :root {
-  --fg: #1a1a1a;
-  --muted: #5a5a5a;
-  --bg: #ffffff;
-  --panel: #f6f6f6;
-  --border: #d8d8d8;
-  --accent: #2563eb;
-  --green: #16a34a;
-  --amber: #b45309;
-  --red: #dc2626;
-  --code-bg: #f0f0f0;
-}
-:root[data-theme='dark'] {
-  --fg: #e8e8e8;
-  --muted: #9aa0a6;
-  --bg: #121316;
-  --panel: #1c1d22;
-  --border: #2c2e35;
-  --accent: #6ea8fe;
-  --green: #4ade80;
-  --amber: #fbbf24;
-  --red: #f87171;
-  --code-bg: #202128;
+  --radius: 0.5rem;
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  /* Darkened from shadcn's 0.556: that value is 4.34:1 on the muted panel,
+   * and muted text on a panel is the single most common pairing here. */
+  --muted-foreground: oklch(0.53 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.55 0.22 27.3);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  /* Darkened from shadcn's 0.708, which is 2.59:1 on white — below the 3:1
+   * floor for a non-text UI indicator. The focus ring is the one thing that
+   * must never be subtle. */
+  --ring: oklch(0.58 0 0);
+
+  /* Agent state. Rendered as text + border on a transparent pill, so these are
+   * read as foreground colors and must clear 4.5:1 on background and panel. */
+  --state-running: oklch(0.51 0.15 150);
+  --state-parked: oklch(0.53 0 0);
+  --state-pending: oklch(0.52 0.13 75);
+  --state-terminal: oklch(0.52 0.19 260);
+  --state-failed: oklch(0.55 0.22 27.3);
+
+  /* Workspace diff. Same hues as state, so "added" and "running" read as one
+   * family rather than two unrelated greens. */
+  --diff-added: oklch(0.51 0.15 150);
+  --diff-changed: oklch(0.52 0.13 75);
+  --diff-removed: oklch(0.55 0.22 27.3);
+
+  --chart-1: oklch(0.51 0.15 150);
+  --chart-2: oklch(0.52 0.19 260);
+  --chart-3: oklch(0.52 0.13 75);
+  --chart-4: oklch(0.55 0.22 27.3);
+  --chart-5: oklch(0.53 0 0);
+
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
 }
 
-html { color-scheme: light dark; }
-body {
-  margin: 0;
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  color: var(--fg);
-  background: var(--bg);
-  font-size: 14px;
-  line-height: 1.45;
-}
-a { color: var(--accent); }
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: 2px;
-}
-button { font: inherit; }
+[data-theme='dark'] {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.371 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
 
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
-th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
-tr.row { cursor: pointer; }
-tr.row:hover { background: var(--panel); }
+  --state-running: oklch(0.75 0.16 150);
+  --state-parked: oklch(0.708 0 0);
+  --state-pending: oklch(0.8 0.14 80);
+  --state-terminal: oklch(0.72 0.13 250);
+  --state-failed: oklch(0.704 0.191 22.216);
 
-.state-pill {
-  display: inline-block; padding: 0.05rem 0.4rem; border-radius: 99px;
-  font-size: 0.7rem; font-weight: 600; border: 1px solid var(--border);
-}
-.state-running { color: var(--green); border-color: var(--green); }
-.state-parked { color: var(--muted); }
-.state-pending { color: var(--amber); border-color: var(--amber); }
-.state-completed { color: var(--accent); border-color: var(--accent); }
-.state-failed, .state-cancelled { color: var(--red); border-color: var(--red); }
+  --diff-added: oklch(0.75 0.16 150);
+  --diff-changed: oklch(0.8 0.14 80);
+  --diff-removed: oklch(0.704 0.191 22.216);
 
-.muted { color: var(--muted); }
-.small { font-size: 0.8rem; }
-.code {
-  font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
-  background: var(--code-bg); padding: 0.1rem 0.3rem; border-radius: 3px;
-  font-size: 0.82em;
-}
-.card {
-  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-  padding: 0.75rem;
-}
-.btn {
-  background: var(--accent); color: #fff; border: none; border-radius: 4px;
-  padding: 0.3rem 0.7rem; cursor: pointer; font-size: 0.85rem;
-}
-.btn:hover { filter: brightness(1.08); }
-.btn.ghost { background: none; color: var(--muted); border: 1px solid var(--border); }
-.btn.ghost:hover { color: var(--fg); border-color: var(--fg); }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  --chart-1: oklch(0.75 0.16 150);
+  --chart-2: oklch(0.72 0.13 250);
+  --chart-3: oklch(0.8 0.14 80);
+  --chart-4: oklch(0.704 0.191 22.216);
+  --chart-5: oklch(0.708 0 0);
 
-.grid3 { display: grid; grid-template-columns: 16rem 1fr 22rem; gap: 0.75rem; height: calc(100vh - 3.2rem); }
-.col { display: flex; flex-direction: column; min-height: 0; }
-.col-scroll { overflow: auto; }
-.pane-title { font-weight: 600; margin: 0 0 0.4rem; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.439 0 0);
+}
 
-@media (max-width: 1100px) {
-  .grid3 { grid-template-columns: 1fr; height: auto; }
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-state-running: var(--state-running);
+  --color-state-parked: var(--state-parked);
+  --color-state-pending: var(--state-pending);
+  --color-state-terminal: var(--state-terminal);
+  --color-state-failed: var(--state-failed);
+  --color-diff-added: var(--diff-added);
+  --color-diff-changed: var(--diff-changed);
+  --color-diff-removed: var(--diff-removed);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* System stacks only. The dashboard must render completely with no route to
+   * the public internet, so it ships no font files and fetches none; the mono
+   * face is whatever the operator's terminal already uses. */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'SFMono-Regular', 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* Console density: one notch below Tailwind's defaults across the board.
+   * Set here rather than per call site so a component added later inherits it. */
+  --text-xs: 0.6875rem;
+  --text-xs--line-height: 1.45;
+  --text-sm: 0.78125rem;
+  --text-sm--line-height: 1.5;
+  --text-base: 0.875rem;
+  --text-base--line-height: 1.5;
+  --text-lg: 1rem;
+  --text-lg--line-height: 1.45;
+  --text-xl: 1.125rem;
+  --text-xl--line-height: 1.35;
+  --text-2xl: 1.375rem;
+  --text-2xl--line-height: 1.25;
+}
+
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border);
+  }
+
+  html {
+    /* Keeps native form controls and scrollbars in step with the resolved
+     * theme; the attribute selector above drives everything else. */
+    color-scheme: light;
+  }
+
+  [data-theme='dark'] {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans text-base;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* One focus treatment for the whole app, including the vendored components
+   * (they add a ring of their own; this is the floor for everything else). */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
 }

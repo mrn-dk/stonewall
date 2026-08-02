@@ -1,5 +1,9 @@
 <script>
   import '../app.css';
+  import { Button } from '$lib/components/ui/button/index.js';
+  import { theme, startTheme } from '$lib/theme.svelte.js';
+
+  startTheme();
 
   let token = $state(localStorage.getItem('stonewall.token') ?? '');
 
@@ -12,17 +16,6 @@
     token = '';
     localStorage.removeItem('stonewall.token');
   }
-  function toggleTheme() {
-    const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = t;
-    localStorage.setItem('stonewall.theme', t);
-  }
-  // Restore saved theme on first paint.
-  if (typeof localStorage !== 'undefined') {
-    const saved = localStorage.getItem('stonewall.theme');
-    if (saved) document.documentElement.dataset.theme = saved;
-  }
-
   let { children } = $props();
 </script>
 
@@ -45,7 +38,9 @@
           aria-label="API token"
         />
       {/if}
-      <button class="theme" onclick={toggleTheme} title="toggle theme" aria-label="toggle theme">◐</button>
+      <Button variant="outline" size="sm" onclick={() => theme.cycle()} title="toggle theme">
+        theme: {theme.preference}
+      </Button>
     </div>
   </header>
 
