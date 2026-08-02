@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/mrn-dk/stonewall/internal/model"
@@ -20,7 +21,11 @@ type eventLog struct {
 	mu   sync.Mutex
 	f    *os.File
 	last uint64 // last allocated sequence number
-	turn int    // last turn recorded
+	// completed is the number of turn boundaries this agent's history contains
+	// (for a fork, starting from the turn it was forked at). The turn ordinal is
+	// counted here exactly as the sequence number is, which is what makes it
+	// cumulative across activations: a counted number cannot regress.
+	completed int
 }
 
 // eventPath is the JSONL file for an agent.
@@ -51,7 +56,11 @@ func (s *Store) openLog(agentID string) (*eventLog, error) {
 	return l, nil
 }
 
-// reconcile reads the tail of the file to recover last/turn after a crash.
+// reconcile reads the file to recover the sequence and the turn count after a
+// crash or restart. Both are recounted from the log rather than trusted from
+// the index, because the log is the authoritative record. The turn count is a
+// count of turn boundaries, so it recovers correctly even for a log whose
+// events carry the colliding turn numbers written by an earlier version.
 func (l *eventLog) reconcile() error {
 	f, err := os.Open(l.path)
 	if err != nil {
@@ -63,7 +72,8 @@ func (l *eventLog) reconcile() error {
 	defer f.Close()
 	dec := json.NewDecoder(f)
 	var maxSeq uint64
-	var maxTurn int
+	completed := 0
+	first := true
 	for {
 		var e model.Event
 		if err := dec.Decode(&e); err != nil {
@@ -81,13 +91,35 @@ func (l *eventLog) reconcile() error {
 		if e.Seq > maxSeq {
 			maxSeq = e.Seq
 		}
-		if e.Turn > maxTurn {
-			maxTurn = e.Turn
+		if first {
+			first = false
+			// A fork continues its parent's numbering from the turn it branched
+			// at, so the merged history it presents stays unambiguous.
+			if e.Kind == model.EventFork {
+				completed = forkParentTurn(e.Payload)
+			}
+		}
+		if e.Kind == model.EventTurnBoundary {
+			completed++
 		}
 	}
 	l.last = maxSeq
-	l.turn = maxTurn
+	l.completed = completed
 	return nil
+}
+
+// forkParentTurn reads the parent turn out of a fork pointer's payload.
+func forkParentTurn(payload json.RawMessage) int {
+	var p struct {
+		ParentTurn int `json:"parent_turn"`
+	}
+	if len(payload) == 0 {
+		return 0
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return p.ParentTurn
 }
 
 // close closes the underlying file handle.
@@ -100,9 +132,16 @@ func (l *eventLog) close() {
 	}
 }
 
-// append writes one event to the JSONL file, fsyncs it (instance-durable), and
-// updates the SQLite index. Sequence is allocated here, monotonic per agent.
-func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, turn int, idem string, payload any) (*model.Event, error) {
+// AppendEvent writes one event to the JSONL file, fsyncs it (instance-durable),
+// and updates the SQLite index. Both the sequence number and the turn ordinal
+// are allocated here, monotonic per agent.
+//
+// runtimeTurn is whatever the writer counted for itself. It is NOT the event's
+// turn: a runtime's counter is a per-activation budget and resets at every wake,
+// so it is retained in the payload as run-relative information (`runtime_turn`)
+// and nothing else. The authoritative ordinal is counted by the store: events
+// carry completed_turns+1, and a turn-boundary event closes that turn.
+func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, runtimeTurn int, idem string, payload any) (*model.Event, error) {
 	l, err := s.openLog(agentID)
 	if err != nil {
 		return nil, err
@@ -110,7 +149,7 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Materialize payload.
+	// Materialize payload, retaining the writer's own turn number in it.
 	var raw json.RawMessage
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -119,6 +158,7 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 		}
 		raw = b
 	}
+	raw = withRuntimeTurn(raw, runtimeTurn)
 	l.last++
 	e := &model.Event{
 		Seq:            l.last,
@@ -126,13 +166,10 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 		ActivationID:   activationID,
 		Kind:           kind,
 		OccurredAt:     now(),
-		Turn:           turn,
+		Turn:           l.completed + 1,
 		Durability:     model.DurabilityFleet, // single node: local fsync == fleet ack
 		IdempotencyKey: idem,
 		Payload:        raw,
-	}
-	if turn > l.turn {
-		l.turn = turn
 	}
 	line, err := json.Marshal(e)
 	if err != nil {
@@ -154,8 +191,14 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 		return nil, fmt.Errorf("store: fsync event log: %w", err)
 	}
 
+	// The turn closes only once its boundary is durable.
+	boundary := kind == model.EventTurnBoundary
+	if boundary {
+		l.completed++
+	}
+
 	// Update the SQLite index so list/stream queries have last_seq/last_turn.
-	if err := s.advanceAgent(agentID, l.last, l.turn); err != nil {
+	if err := s.advanceAgent(agentID, l.last, boundary); err != nil {
 		// Index lag is recoverable from the JSONL on restart; the event is
 		// already durable. Log but do not fail the append.
 		_ = err
@@ -163,15 +206,55 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 	return e, nil
 }
 
+// withRuntimeTurn records the writer's own turn number alongside its payload.
+// The store's ordinal is authoritative; this is kept so "what did the guest
+// think it was doing" can still be reconciled against "where the log says it
+// happened" — the question worth asking when a runtime misbehaves.
+func withRuntimeTurn(raw json.RawMessage, runtimeTurn int) json.RawMessage {
+	if runtimeTurn <= 0 {
+		return raw
+	}
+	fields := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			// Not a JSON object (array or scalar): leave the writer's payload
+			// exactly as it was rather than reshaping it.
+			return raw
+		}
+	}
+	if _, ok := fields["runtime_turn"]; ok {
+		return raw
+	}
+	fields["runtime_turn"] = json.RawMessage(strconv.Itoa(runtimeTurn))
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
 // AppendForkPointer writes the initial EventFork entry to a freshly forked
 // agent's log. The parent pointer is the first entry; reading history then
 // walks the parent chain.
+//
+// The child continues its parent's turn numbering from the fork point, so the
+// history a fork presents (its ancestors' turns plus its own) stays a single
+// ascending run of ordinals.
 func (s *Store) AppendForkPointer(childID, parentID string, parentTurn int) error {
+	l, err := s.openLog(childID)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	if l.last == 0 && parentTurn > 0 {
+		l.completed = parentTurn
+	}
+	l.mu.Unlock()
 	payload := map[string]any{
 		"parent_id":   parentID,
 		"parent_turn": parentTurn,
 	}
-	_, err := s.AppendEvent(childID, "", model.EventFork, 0, "", payload)
+	_, err = s.AppendEvent(childID, "", model.EventFork, 0, "", payload)
 	return err
 }
 

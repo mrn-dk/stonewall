@@ -249,10 +249,19 @@ func (s *Store) UpdateState(id string, to model.AgentState) error {
 // advanceAgent records the event index after an append. It advances only
 // last_seq and last_turn; last_checkpoint is owned by SetLastCheckpoint so
 // ordinary event appends never clobber it.
-func (s *Store) advanceAgent(id string, lastSeq uint64, lastTurn int) error {
+//
+// last_turn counts turn boundaries: a boundary increments it, everything else
+// leaves it alone. It is an increment rather than an assignment because an
+// assignment is what let a woken agent's per-activation counter overwrite the
+// agent's position in its own history.
+func (s *Store) advanceAgent(id string, lastSeq uint64, turnCompleted bool) error {
+	inc := 0
+	if turnCompleted {
+		inc = 1
+	}
 	_, err := s.db.Exec(
-		`UPDATE agents SET last_seq = ?, last_turn = ?, updated_at = ? WHERE id = ?`,
-		lastSeq, lastTurn, now().UnixNano(), id,
+		`UPDATE agents SET last_seq = ?, last_turn = last_turn + ?, updated_at = ? WHERE id = ?`,
+		lastSeq, inc, now().UnixNano(), id,
 	)
 	return err
 }

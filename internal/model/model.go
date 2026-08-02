@@ -225,11 +225,20 @@ const (
 // Event is one entry in an agent's append-only event log. Sequence numbers are
 // strictly increasing per agent with no gaps, spanning all activations.
 type Event struct {
-	Seq            uint64          `json:"seq"`
-	AgentID        string          `json:"agent_id"`
-	ActivationID   string          `json:"activation_id,omitempty"`
-	Kind           EventKind       `json:"kind"`
-	OccurredAt     time.Time       `json:"occurred_at"`
+	Seq          uint64    `json:"seq"`
+	AgentID      string    `json:"agent_id"`
+	ActivationID string    `json:"activation_id,omitempty"`
+	Kind         EventKind `json:"kind"`
+	OccurredAt   time.Time `json:"occurred_at"`
+	// Turn is the authoritative turn ordinal, assigned by the store at append
+	// time as a count of the turn boundaries in the agent's history. It spans
+	// all activations and never restarts, so it addresses one turn in the
+	// agent's life.
+	//
+	// It is deliberately NOT the number the runtime counted for itself: a
+	// runtime's counter is a per-activation budget, so a guest emitting its
+	// turn 3 may well see the log record turn 9. The guest's number is retained
+	// in the payload as `runtime_turn` and is informational only.
 	Turn           int             `json:"turn,omitempty"`
 	Durability     DurabilityLevel `json:"durability"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
