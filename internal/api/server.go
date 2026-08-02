@@ -37,15 +37,17 @@ import (
 
 // Server is the control-plane HTTP server.
 type Server struct {
-	store *store.Store
-	node  *node.Node
-	addr  string
-	srv   *http.Server
+	store   *store.Store
+	node    *node.Node
+	addr    string
+	dataDir string
+	srv     *http.Server
 }
 
-// New creates a control-plane server bound to addr.
-func New(addr string, s *store.Store, n *node.Node) *Server {
-	srv := &Server{store: s, node: n, addr: addr}
+// New creates a control-plane server bound to addr. dataDir is the store's
+// root, used only for node storage-size stats (read through the API).
+func New(addr string, s *store.Store, n *node.Node, dataDir string) *Server {
+	srv := &Server{store: s, node: n, addr: addr, dataDir: dataDir}
 	mux := http.NewServeMux()
 	srv.register(mux)
 	srv.srv = &http.Server{Addr: addr, Handler: requestLogger(mux)}
@@ -67,6 +69,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/{id}/approvals/{aid}", s.resolveApproval)
 	mux.HandleFunc("GET /v1/agents/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /v1/agents/{id}/activations", s.listActivations)
+	mux.HandleFunc("GET /v1/node/stats", s.nodeStatsHandler)
+	mux.HandleFunc("GET /v1/agents/{id}/workspace", s.browseWorkspace)
+	mux.HandleFunc("GET /v1/agents/{id}/checkpoints/{ckpt}/files", s.browseCheckpointFiles)
+	mux.HandleFunc("GET /v1/agents/{id}/checkpoints/{ckpt}/file", s.readCheckpointFile)
 }
 
 // ListenAndServe starts the control plane.

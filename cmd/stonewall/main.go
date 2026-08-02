@@ -99,7 +99,7 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	srv := api.New(c.HTTPAddr, s, n)
+	srv := api.New(c.HTTPAddr, s, n, c.DataDir)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
 			log.Fatalf("http: %v", err)

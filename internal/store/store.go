@@ -79,6 +79,9 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Root returns the store's data directory (used for storage-size stats).
+func (s *Store) Root() string { return s.root }
+
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(schema)
 	if err != nil {
