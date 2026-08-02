@@ -31,7 +31,7 @@ func newServerForBrowse(t *testing.T) (*Server, *store.Store, string) {
 		MaxConcurrent: 2, PollInterval: 10 * time.Second, ActivationTimeout: 10 * time.Second,
 		CrashThreshold: 3, NodeBreakerThreshold: 100,
 	})
-	srv := New(":0", s, n, s.Root())
+	srv := New(":0", s, n, s.Root(), nil)
 	ts := httptest.NewServer(srv.srv.Handler)
 	t.Cleanup(ts.Close)
 	srv.addr = ts.URL

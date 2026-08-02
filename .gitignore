@@ -34,6 +34,11 @@ bin/
 *.db-wal
 *.db-shm
 
+# Dashboard (SvelteKit) build + deps
+dashboard/build/
+dashboard/.svelte-kit/
+dashboard/node_modules/
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	stonewall "github.com/mrn-dk/stonewall"
 	"github.com/mrn-dk/stonewall/internal/api"
 	"github.com/mrn-dk/stonewall/internal/config"
 	"github.com/mrn-dk/stonewall/internal/node"
@@ -99,7 +100,7 @@ func cmdServe(args []string) {
 		}
 	}()
 
-	srv := api.New(c.HTTPAddr, s, n, c.DataDir)
+	srv := api.New(c.HTTPAddr, s, n, c.DataDir, stonewall.DashboardFS())
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
 			log.Fatalf("http: %v", err)
