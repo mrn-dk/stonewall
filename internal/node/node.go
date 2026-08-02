@@ -381,30 +381,54 @@ func (n *Node) Cancel(agentID string) error {
 	return nil
 }
 
-// Fork creates a child agent from a parent at a turn boundary. It records the
-// parent pointer as the first log entry and materializes the child's workspace
-// as a copy-on-write view of the parent's checkpoint at that turn (spec §6.5).
+// Fork creates a child agent from the parent's Nth turn boundary. A turn the
+// parent has not reached is not-found; no nearby turn is substituted.
 func (n *Node) Fork(parentID string, atTurn int) (*model.Agent, error) {
+	at, err := n.store.ResolveTurn(parentID, atTurn)
+	if err != nil {
+		return nil, fmt.Errorf("fork: agent %s has no turn %d: %w", parentID, atTurn, err)
+	}
+	return n.forkAt(parentID, at)
+}
+
+// ForkAtSeq creates a child agent from the turn boundary a sequence number
+// addresses, for callers that already hold one. It is the same operation as
+// Fork by ordinal, addressed the other way.
+func (n *Node) ForkAtSeq(parentID string, seq uint64) (*model.Agent, error) {
+	at, err := n.store.ResolveSeq(parentID, seq)
+	if err != nil {
+		return nil, fmt.Errorf("fork: agent %s has no turn boundary at seq %d: %w", parentID, seq, err)
+	}
+	return n.forkAt(parentID, at)
+}
+
+// forkAt records the parent pointer as the child's first log entry and
+// materializes its workspace as a copy-on-write view of the parent's workspace
+// as of that turn boundary (spec §6.5).
+func (n *Node) forkAt(parentID string, at store.TurnBoundary) (*model.Agent, error) {
 	parent, err := n.store.GetAgent(parentID)
 	if err != nil {
 		return nil, err
 	}
-	// Find the parent's checkpoint at (or latest before) atTurn.
-	cp, err := n.checkpointAtTurn(parentID, atTurn)
+	// The parent's workspace as of that point in the log.
+	cp, err := n.store.CheckpointAsOf(parentID, at.Seq)
 	if err != nil {
-		return nil, fmt.Errorf("fork: no checkpoint to fork from at turn %d: %w", atTurn, err)
+		return nil, fmt.Errorf("fork: no checkpoint to fork from at turn %d: %w", at.Turn, err)
 	}
 	child := &model.Agent{
-		ID:               newAgentID(),
-		Image:            parent.Image,
-		Goal:             parent.Goal,
-		Model:            parent.Model,
-		Grants:           parent.Grants,
-		Isolation:        parent.Isolation,
-		Checkpoint:       parent.Checkpoint,
-		ParentID:         parentID,
-		ParentTurn:       atTurn,
-		State:            model.StateParked,
+		ID:         newAgentID(),
+		Image:      parent.Image,
+		Goal:       parent.Goal,
+		Model:      parent.Model,
+		Grants:     parent.Grants,
+		Isolation:  parent.Isolation,
+		Checkpoint: parent.Checkpoint,
+		ParentID:   parentID,
+		ParentTurn: at.Turn,
+		State:      model.StateParked,
+		// The child continues the parent's numbering from the fork point, so
+		// its history reads as one ascending run of turns.
+		LastTurn:         at.Turn,
 		LastCheckpointID: cp.ID,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
@@ -413,7 +437,7 @@ func (n *Node) Fork(parentID string, atTurn int) (*model.Agent, error) {
 		return nil, err
 	}
 	// Log chaining: the fork records parent @ turn N as its first entry.
-	if err := n.store.AppendForkPointer(child.ID, parentID, atTurn); err != nil {
+	if err := n.store.AppendForkPointer(child.ID, parentID, at.Turn); err != nil {
 		return nil, err
 	}
 	// Copy-on-write workspace: materialize from the parent checkpoint.
@@ -421,13 +445,6 @@ func (n *Node) Fork(parentID string, atTurn int) (*model.Agent, error) {
 		return nil, err
 	}
 	return child, nil
-}
-
-// checkpointAtTurn returns the parent's checkpoint at the requested turn
-// boundary, or the nearest ancestor (spec §6.4: forks are valid only at turn
-// boundaries).
-func (n *Node) checkpointAtTurn(agentID string, atTurn int) (*model.Checkpoint, error) {
-	return n.store.CheckpointForTurn(agentID, atTurn)
 }
 
 // grantsToMap converts model.Grants to the loose map the runtime expects.

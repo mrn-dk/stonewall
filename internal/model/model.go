@@ -260,10 +260,17 @@ type FileEntry struct {
 // turn N" is a lookup and transcript and workspace are consistent by
 // construction (spec §5.2, §6.1).
 type Checkpoint struct {
-	ID        string               `json:"id"` // digest of the manifest
-	AgentID   string               `json:"agent_id"`
-	Turn      int                  `json:"turn"`
-	ParentID  string               `json:"parent_id,omitempty"`
-	Manifest  map[string]FileEntry `json:"manifest"`
-	CreatedAt time.Time            `json:"created_at"`
+	ID      string `json:"id"` // digest of the manifest
+	AgentID string `json:"agent_id"`
+	Turn    int    `json:"turn"`
+	// BoundarySeq is the sequence of the turn boundary this checkpoint was
+	// produced at — the point in the log whose workspace it holds. "The
+	// workspace as of turn N" is the most recent checkpoint at or before that
+	// boundary's sequence: one range query, one answer, correct for turns whose
+	// policy produced no checkpoint. 0 means not known (pre-existing rows
+	// awaiting backfill from the log).
+	BoundarySeq uint64               `json:"boundary_seq,omitempty"`
+	ParentID    string               `json:"parent_id,omitempty"`
+	Manifest    map[string]FileEntry `json:"manifest"`
+	CreatedAt   time.Time            `json:"created_at"`
 }

@@ -77,7 +77,11 @@ func (s *Store) getChunk(digest string) ([]byte, error) {
 // chunks are unchanged relative to the parent reference the parent's chunks; only
 // dirty files produce new chunks. The checkpoint manifest's digest is the
 // checkpoint id (spec §5.2, §6.2).
-func (s *Store) SnapshotWorkspace(agentID string, turn int, workspaceDir string, parentID string) (*model.Checkpoint, error) {
+//
+// turn is the store-assigned ordinal of the turn boundary that produced this
+// snapshot and boundarySeq is that boundary's sequence — the address the
+// workspace is later resolved by.
+func (s *Store) SnapshotWorkspace(agentID string, turn int, boundarySeq uint64, workspaceDir string, parentID string) (*model.Checkpoint, error) {
 	manifest := map[string]model.FileEntry{}
 	// Walk the workspace, chunking each file.
 	err := filepath.Walk(workspaceDir, func(path string, info os.FileInfo, err error) error {
@@ -141,12 +145,13 @@ func (s *Store) SnapshotWorkspace(agentID string, turn int, workspaceDir string,
 		return nil, err
 	}
 	cp := &model.Checkpoint{
-		ID:        id,
-		AgentID:   agentID,
-		Turn:      turn,
-		ParentID:  parentID,
-		Manifest:  manifest,
-		CreatedAt: now(),
+		ID:          id,
+		AgentID:     agentID,
+		Turn:        turn,
+		BoundarySeq: boundarySeq,
+		ParentID:    parentID,
+		Manifest:    manifest,
+		CreatedAt:   now(),
 	}
 	if err := s.putCheckpoint(cp); err != nil {
 		return nil, err
@@ -208,16 +213,35 @@ func manifestDigest(manifest map[string]model.FileEntry) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// checkpointCols is the column list every checkpoint query selects, in the
+// order scanCheckpoint expects.
+const checkpointCols = `id,agent_id,turn,boundary_seq,parent_id,manifest,created_at`
+
 // putCheckpoint persists a checkpoint row.
+//
+// The id is the manifest digest, so two turns that leave the workspace
+// byte-identical write the same row. When that happens the earliest boundary
+// keeps the addressing correct — the same content is still resolvable from that
+// point in the log onwards — while created_at tracks the latest write.
 func (s *Store) putCheckpoint(cp *model.Checkpoint) error {
 	b, err := json.Marshal(cp.Manifest)
 	if err != nil {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT OR REPLACE INTO checkpoints (id,agent_id,turn,parent_id,manifest,created_at)
-		 VALUES (?,?,?,?,?,?)`,
-		cp.ID, cp.AgentID, cp.Turn, cp.ParentID, string(b), cp.CreatedAt.UnixNano(),
+		`INSERT INTO checkpoints (id,agent_id,turn,boundary_seq,parent_id,manifest,created_at)
+		 VALUES (?,?,?,?,?,?,?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   turn = excluded.turn,
+		   boundary_seq = CASE
+		     WHEN checkpoints.boundary_seq = 0 THEN excluded.boundary_seq
+		     WHEN excluded.boundary_seq = 0 THEN checkpoints.boundary_seq
+		     WHEN excluded.boundary_seq < checkpoints.boundary_seq THEN excluded.boundary_seq
+		     ELSE checkpoints.boundary_seq END,
+		   parent_id = excluded.parent_id,
+		   manifest = excluded.manifest,
+		   created_at = excluded.created_at`,
+		cp.ID, cp.AgentID, cp.Turn, cp.BoundarySeq, cp.ParentID, string(b), cp.CreatedAt.UnixNano(),
 	)
 	return err
 }
@@ -225,7 +249,7 @@ func (s *Store) putCheckpoint(cp *model.Checkpoint) error {
 // GetCheckpoint loads a checkpoint by id.
 func (s *Store) GetCheckpoint(id string) (*model.Checkpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id,agent_id,turn,parent_id,manifest,created_at FROM checkpoints WHERE id = ?`, id,
+		`SELECT `+checkpointCols+` FROM checkpoints WHERE id = ?`, id,
 	)
 	cp, err := scanCheckpoint(row)
 	if err != nil {
@@ -237,11 +261,14 @@ func (s *Store) GetCheckpoint(id string) (*model.Checkpoint, error) {
 	return cp, nil
 }
 
-// LatestCheckpointForAgent returns the most recent checkpoint for an agent.
+// LatestCheckpointForAgent returns the most recently created checkpoint for an
+// agent. It orders by creation time, not by turn number: "highest turn" only
+// meant "latest" while turns were monotonic, which is the assumption that
+// failed.
 func (s *Store) LatestCheckpointForAgent(agentID string) (*model.Checkpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id,agent_id,turn,parent_id,manifest,created_at FROM checkpoints
-		 WHERE agent_id = ? ORDER BY turn DESC LIMIT 1`, agentID,
+		`SELECT `+checkpointCols+` FROM checkpoints
+		 WHERE agent_id = ? ORDER BY created_at DESC, boundary_seq DESC, rowid DESC LIMIT 1`, agentID,
 	)
 	cp, err := scanCheckpoint(row)
 	if err != nil {
@@ -253,37 +280,43 @@ func (s *Store) LatestCheckpointForAgent(agentID string) (*model.Checkpoint, err
 	return cp, nil
 }
 
-// CheckpointForTurn returns the checkpoint produced at exactly `turn`, or if none,
-// the latest checkpoint with turn <= atTurn (the nearest ancestor), so forks at a
-// turn boundary restore a consistent, existing snapshot.
-func (s *Store) CheckpointForTurn(agentID string, atTurn int) (*model.Checkpoint, error) {
+// CheckpointAsOf returns the workspace as it stood at a point in the log: the
+// most recent checkpoint produced at or before boundarySeq. One query, one
+// answer — including for a turn whose checkpoint policy produced no checkpoint,
+// which correctly resolves backwards to the last one taken.
+func (s *Store) CheckpointAsOf(agentID string, boundarySeq uint64) (*model.Checkpoint, error) {
 	row := s.db.QueryRow(
-		`SELECT id,agent_id,turn,parent_id,manifest,created_at FROM checkpoints
-		 WHERE agent_id = ? AND turn = ? ORDER BY created_at DESC LIMIT 1`,
-		agentID, atTurn,
+		`SELECT `+checkpointCols+` FROM checkpoints
+		 WHERE agent_id = ? AND boundary_seq <= ?
+		 ORDER BY boundary_seq DESC, created_at DESC, rowid DESC LIMIT 1`,
+		agentID, boundarySeq,
 	)
 	cp, err := scanCheckpoint(row)
-	if err == nil {
-		return cp, nil
-	}
-	// Fall back to the latest checkpoint with turn <= atTurn.
-	row = s.db.QueryRow(
-		`SELECT id,agent_id,turn,parent_id,manifest,created_at FROM checkpoints
-		 WHERE agent_id = ? AND turn <= ? ORDER BY turn DESC LIMIT 1`,
-		agentID, atTurn,
-	)
-	cp, err = scanCheckpoint(row)
 	if err != nil {
-		return nil, ErrNotFound
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
 	}
 	return cp, nil
+}
+
+// CheckpointAtTurn resolves at_turn=N to the Nth turn boundary of the agent's
+// log and returns the workspace as of that point. A turn the agent has not
+// reached is ErrNotFound; no nearby turn is substituted.
+func (s *Store) CheckpointAtTurn(agentID string, atTurn int) (*model.Checkpoint, error) {
+	b, err := s.ResolveTurn(agentID, atTurn)
+	if err != nil {
+		return nil, err
+	}
+	return s.CheckpointAsOf(agentID, b.Seq)
 }
 
 func scanCheckpoint(row *sql.Row) (*model.Checkpoint, error) {
 	cp := &model.Checkpoint{}
 	var manifest string
 	var createdN int64
-	if err := row.Scan(&cp.ID, &cp.AgentID, &cp.Turn, &cp.ParentID, &manifest, &createdN); err != nil {
+	if err := row.Scan(&cp.ID, &cp.AgentID, &cp.Turn, &cp.BoundarySeq, &cp.ParentID, &manifest, &createdN); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(manifest), &cp.Manifest); err != nil {

@@ -16,11 +16,17 @@ func (s *Server) nodeStatsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // browseWorkspace returns a read-only file tree of an agent's workspace as it
-// existed at a chosen turn (or the latest checkpoint when at_turn is omitted).
+// existed at a chosen turn (or the latest checkpoint when no address is given).
 // It reconstructs from the content-addressed manifest and does NOT mutate the
 // live workspace — distinct from the restore endpoint, which rewrites it.
 //
-//	Query: at_turn=<N>  (optional; defaults to the latest checkpoint)
+//	Query: at_turn=<N>  the Nth turn boundary of the agent's log, across all
+//	                    of its activations
+//	Query: seq=<S>      that boundary's sequence number — the same address,
+//	                    for callers that already hold one
+//
+// Both are optional and mutually exclusive; omitting them returns the most
+// recently created checkpoint. A turn the agent has not reached is not-found.
 func (s *Server) browseWorkspace(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	cp := s.resolveCheckpointForTurn(w, r, id)
@@ -32,6 +38,7 @@ func (s *Server) browseWorkspace(w http.ResponseWriter, r *http.Request) {
 		"agent_id":      id,
 		"checkpoint_id": cp.ID,
 		"turn":          cp.Turn,
+		"boundary_seq":  cp.BoundarySeq,
 		"files":         nodes,
 	})
 }
@@ -58,6 +65,7 @@ func (s *Server) browseCheckpointFiles(w http.ResponseWriter, r *http.Request) {
 		"agent_id":      id,
 		"checkpoint_id": cp.ID,
 		"turn":          cp.Turn,
+		"boundary_seq":  cp.BoundarySeq,
 		"files":         nodes,
 	})
 }
@@ -105,29 +113,52 @@ func (s *Server) readCheckpointFile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// resolveCheckpointForTurn loads the checkpoint for at_turn (or the latest),
-// writing an error response on failure. Returns nil on error (response sent).
+// resolveCheckpointForTurn loads the workspace as of the point the request
+// addresses — at_turn=N (the Nth turn boundary of the agent's log) or seq=S
+// (that boundary's sequence) — or the most recently created checkpoint when
+// neither is given. Writing an error response on failure; returns nil then.
 func (s *Server) resolveCheckpointForTurn(w http.ResponseWriter, r *http.Request, agentID string) *model.Checkpoint {
 	atTurn := 0
 	if v := r.URL.Query().Get("at_turn"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			atTurn = n
-		} else {
+		n, err := strconv.Atoi(v)
+		if err != nil {
 			badRequest(w, "at_turn must be an integer")
 			return nil
 		}
+		atTurn = n
 	}
-	if atTurn > 0 {
-		cp, err := s.store.CheckpointForTurn(agentID, atTurn)
+	var atSeq uint64
+	if v := r.URL.Query().Get("seq"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				notFound(w, "no checkpoint at turn "+strconv.Itoa(atTurn))
-				return nil
-			}
-			internalErr(w, err.Error())
+			badRequest(w, "seq must be a non-negative integer")
 			return nil
 		}
-		return cp
+		atSeq = n
+	}
+	if atTurn > 0 && atSeq > 0 {
+		badRequest(w, "at_turn and seq address the same thing; supply only one")
+		return nil
+	}
+	if atTurn > 0 || atSeq > 0 {
+		at, err := s.resolveBoundary(agentID, atTurn, atSeq)
+		if err == nil {
+			var cp *model.Checkpoint
+			cp, err = s.store.CheckpointAsOf(agentID, at.Seq)
+			if err == nil {
+				return cp
+			}
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			if atSeq > 0 {
+				notFound(w, "no turn boundary at seq "+strconv.FormatUint(atSeq, 10))
+			} else {
+				notFound(w, "no checkpoint at turn "+strconv.Itoa(atTurn))
+			}
+			return nil
+		}
+		internalErr(w, err.Error())
+		return nil
 	}
 	cp, err := s.store.LatestCheckpointForAgent(agentID)
 	if err != nil {
@@ -139,4 +170,13 @@ func (s *Server) resolveCheckpointForTurn(w http.ResponseWriter, r *http.Request
 		return nil
 	}
 	return cp
+}
+
+// resolveBoundary resolves whichever address was supplied to the one turn
+// boundary it names.
+func (s *Server) resolveBoundary(agentID string, atTurn int, atSeq uint64) (store.TurnBoundary, error) {
+	if atSeq > 0 {
+		return s.store.ResolveSeq(agentID, atSeq)
+	}
+	return s.store.ResolveTurn(agentID, atTurn)
 }
