@@ -4,7 +4,7 @@
   import * as Empty from '$lib/components/ui/empty/index.js';
 
   let { title, description = '', icon, children, class: className = '' } = $props();
-  const Icon = icon;
+  const Icon = $derived(icon);
 </script>
 
 <Empty.Root class="border {className}">

@@ -1,367 +1,598 @@
 <script>
-  import { api } from '$lib/api.js';
-  import { onMount, onDestroy } from 'svelte';
-  import { page } from '$app/stores';
+  // The agent-author workbench — the primary surface.
+  //
+  // Three panes keyed by turn: the operational timeline, the conversation
+  // transcript, and the workspace as it existed at the selected turn. Turn is
+  // the join key: selecting one in the timeline syncs the other two, which is
+  // possible because each turn's checkpoint id is recorded in the event log.
+  //
+  // The live feed and the audit record are the same object: this reads the
+  // durable log over SSE, and EventSource's own Last-Event-ID reconnect is the
+  // resume mechanism — there is no separate "archive mode" for a terminal
+  // agent.
+  import { onDestroy } from 'svelte';
+  import { page } from '$app/state';
+  import { goto } from '$app/navigation';
+  import { api, checkpointFileText } from '$lib/api.js';
+  import { session } from '$lib/session.svelte.js';
+  import { toasts } from '$lib/toasts.svelte.js';
+  import { registerPaletteActions } from '$lib/palette.svelte.js';
 
-  let id = $page.params.id;
+  import * as Resizable from '$lib/components/ui/resizable/index.js';
+  import { Button } from '$lib/components/ui/button/index.js';
+  import { Input } from '$lib/components/ui/input/index.js';
+  import AgentStateBadge from '$lib/components/agent-state-badge.svelte';
+  import ConfirmDialog from '$lib/components/confirm-dialog.svelte';
+  import AgentConfig from '$lib/components/workbench/agent-config.svelte';
+  import Timeline from '$lib/components/workbench/timeline.svelte';
+  import Transcript from '$lib/components/workbench/transcript.svelte';
+  import WorkspacePane from '$lib/components/workbench/workspace-pane.svelte';
+  import Activations from '$lib/components/workbench/activations.svelte';
+  import Approvals from '$lib/components/workbench/approvals.svelte';
+  import LoadingState from '$lib/components/states/loading-state.svelte';
+  import ErrorState from '$lib/components/states/error-state.svelte';
+
+  import Send from '@lucide/svelte/icons/send';
+  import Ban from '@lucide/svelte/icons/ban';
+  import GitFork from '@lucide/svelte/icons/git-fork';
+  import History from '@lucide/svelte/icons/history';
+  import Diamond from '@lucide/svelte/icons/diamond';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+
+  const id = $derived(page.params.id);
+
   let agent = $state(null);
+  let agentError = $state(null);
   let activations = $state([]);
+  let activationsError = $state(null);
+  let activationsLoading = $state(true);
   let events = $state([]);
+  let connected = $state(true);
+  let activeActivation = $state(null);
+
   let selectedTurn = $state(null);
   let workspace = $state(null);
-  let fileContent = $state(null);
-  let activeFile = $state(null);
-  let es = null;
-  let connected = $state(true);
-  let err = $state(null);
-  let actionErr = $state(null);
-  let busy = $state({ input: false, cancel: false });
-  let inputBody = $state('');
-  let isReadonly = $state(false);
-  let activeActivation = $state(null);
+  let workspaceLoading = $state(false);
+  let workspaceError = $state(null);
   let showDiff = $state(false);
   let diff = $state(null);
+  let activeFile = $state(null);
+  let fileContent = $state(null);
+  let fileLoading = $state(false);
+
+  let inputBody = $state('');
+  let busy = $state({
+    input: false,
+    cancel: false,
+    fork: false,
+    restore: false,
+    checkpoint: false,
+    delete: false,
+    approval: false
+  });
   let resolving = $state({});
+  // `confirm` describes the pending confirmation; `confirmOpen` is the dialog's
+  // own open state, so dismissing with Escape or Cancel closes it properly
+  // rather than leaving a dialog the parent still believes is open.
+  let confirm = $state(null);
+  let confirmOpen = $state(false);
 
-  onMount(load);
-  onDestroy(() => es && es.close());
-
-  async function load() {
-    try {
-      [agent, activations] = await Promise.all([
-        api.getAgent(id),
-        api.activations(id).then(r => r.activations || []).catch(() => [])
-      ]);
-      connectEvents(0);
-    } catch (e) {
-      if (e.status === 404) err = { message: 'agent not found', request_id: e.request_id };
-      else err = e;
-    }
+  function ask(spec) {
+    confirm = spec;
+    confirmOpen = true;
   }
 
-  // The SSE server emits NAMED events (event: turn, event: llm_call, ...), so a
-  // generic `message` listener never fires. Bind the handler to each kind.
-  // EventSource auto-reconnects and sends Last-Event-ID, which the server reads
-  // to resume — so we open one stream at after=0 and let it run.
-  const KINDS = ['run_start','run_end','turn','llm_call','tool_intent','tool_result','checkpoint','message','egress','approval','fork','workspace_modified'];
+  let es = null;
+  onDestroy(() => es?.close());
 
-  function onEvent(e) {
-    const ev = JSON.parse(e.data);
-    events = [...events, ev];
-    if (ev.kind === 'turn' && selectedTurn == null) selectedTurn = ev.turn;
-  }
-
-  function connectEvents(after) {
-    es = api.events(id, after);
-    es.onopen = () => (connected = true);
-    es.onerror = () => (connected = false);
-    KINDS.forEach(k => es.addEventListener(k, onEvent));
-  }
-
-  // Derived views: turn is the join key across the three columns.
-  let turns = $derived(buildTimeline(events, activeActivation));
-  let transcript = $derived(
-    events
-      .filter(isConversational)
-      .filter(e => !activeActivation || e.activation_id === activeActivation)
-  );
-  let approvals = $derived(events.filter(e => e.kind === 'approval'));
-
-  // Auto-load the workspace once a turn is first selected (from the first turn event).
+  // Re-entering the workbench for a different agent must not show the previous
+  // agent's stream, so everything resets on id change.
   $effect(() => {
-    if (selectedTurn != null && workspace == null) {
-      selectTurn(selectedTurn);
-    }
+    const agentId = id;
+    reset();
+    loadAgent(agentId);
+    loadActivations(agentId);
+    connectEvents(agentId);
+    return () => {
+      es?.close();
+      es = null;
+    };
   });
 
-  function buildTimeline(evs, act) {
-    const out = [];
-    for (const e of evs) {
-      if (act && e.activation_id && e.activation_id !== act) continue;
-      if (e.kind === 'turn' || e.kind === 'run_start' || e.kind === 'run_end' || e.kind === 'checkpoint') {
-        out.push(e);
-      }
-    }
-    return out;
-  }
-  function isConversational(e) {
-    return e.kind === 'message' || e.kind === 'llm_call' || e.kind === 'tool_intent' || e.kind === 'tool_result' || e.kind === 'workspace_modified';
+  function reset() {
+    agent = null;
+    agentError = null;
+    activations = [];
+    activationsError = null;
+    activationsLoading = true;
+    events = [];
+    connected = true;
+    activeActivation = null;
+    selectedTurn = null;
+    workspace = null;
+    workspaceError = null;
+    diff = null;
+    showDiff = false;
+    activeFile = null;
+    fileContent = null;
+    es?.close();
+    es = null;
   }
 
-  async function selectTurn(t) {
-    selectedTurn = t;
-    fileContent = null; activeFile = null;
-    diff = null; showDiff = false;
+  async function loadAgent(agentId) {
     try {
-      workspace = await api.workspaceAtTurn(id, t);
+      agent = await api.getAgent(agentId);
+      agentError = null;
+    } catch (e) {
+      agentError = e.status === 404 ? { message: 'Agent not found', request_id: e.request_id } : e;
+    }
+  }
+
+  async function loadActivations(agentId = id) {
+    activationsLoading = true;
+    try {
+      const res = await api.activations(agentId);
+      activations = res.activations || [];
+      activationsError = null;
+    } catch (e) {
+      activationsError = e;
+    } finally {
+      activationsLoading = false;
+    }
+  }
+
+  // The server emits NAMED events, so a generic `message` listener never fires;
+  // each kind is bound explicitly. EventSource reconnects on its own and sends
+  // Last-Event-ID, which the server reads to resume — so one stream from 0 is
+  // all that is needed.
+  const KINDS = [
+    'run_start', 'run_end', 'turn', 'llm_call', 'tool_intent', 'tool_result',
+    'checkpoint', 'message', 'egress', 'approval', 'fork', 'workspace_modified'
+  ];
+
+  function connectEvents(agentId) {
+    es = api.events(agentId, 0);
+    es.onopen = () => (connected = true);
+    es.onerror = () => (connected = false);
+    const onEvent = (ev) => {
+      const parsed = JSON.parse(ev.data);
+      events = [...events, parsed];
+      if (parsed.kind === 'turn' && selectedTurn == null) selectTurn(parsed.turn);
+      if (parsed.kind === 'run_end') loadActivations();
+    };
+    KINDS.forEach((k) => es.addEventListener(k, onEvent));
+  }
+
+  const inActivation = (e) => !activeActivation || e.activation_id === activeActivation;
+
+  const timelineEntries = $derived(
+    events.filter(
+      (e) =>
+        inActivation(e) &&
+        ['turn', 'run_start', 'run_end', 'checkpoint'].includes(e.kind)
+    )
+  );
+
+  const transcriptEvents = $derived(
+    events.filter(
+      (e) =>
+        inActivation(e) &&
+        ['message', 'llm_call', 'tool_intent', 'tool_result', 'workspace_modified'].includes(e.kind)
+    )
+  );
+
+  const approvals = $derived(events.filter((e) => e.kind === 'approval'));
+
+  async function selectTurn(turn) {
+    selectedTurn = turn;
+    activeFile = null;
+    fileContent = null;
+    diff = null;
+    showDiff = false;
+    await loadWorkspace();
+  }
+
+  async function loadWorkspace() {
+    if (selectedTurn == null) return;
+    workspaceLoading = true;
+    workspaceError = null;
+    try {
+      workspace = await api.workspaceAtTurn(id, selectedTurn);
     } catch (e) {
       if (e.status === 404) workspace = { files: [], _none: true };
-      else err = e;
+      else workspaceError = e;
+    } finally {
+      workspaceLoading = false;
     }
   }
 
-  // loadDiff compares the current checkpoint tree to the previous checkpoint
-  // (turn-1, or the nearest ancestor) and classifies files as added/changed/
-  // removed/unchanged. A content-addressed manifest makes this a path+size
-  // comparison; real chunk-level diff falls out of the same digests.
+  // Compares the selected checkpoint's manifest to the previous turn's. A
+  // content-addressed manifest makes this a path + chunk comparison rather than
+  // a content diff.
   async function loadDiff() {
-    if (!workspace || workspace._none || !selectedTurn) return;
+    if (!workspace || workspace._none || selectedTurn == null) return;
     try {
       const prev = await api.workspaceAtTurn(id, selectedTurn - 1).catch(() => null);
-      if (!prev || prev._none) { diff = { none: true }; return; }
-      const cur = new Map(workspace.files.map(f => [f.path, f]));
-      const old = new Map(prev.files.map(f => [f.path, f]));
-      const added = [], changed = [], removed = [];
-      for (const [p, f] of cur) {
-        if (!old.has(p)) added.push(p);
-        else if (old.get(p).size !== f.size || !sameChunks(old.get(p), f)) changed.push(p);
+      if (!prev || prev._none) {
+        diff = { none: true };
+        return;
       }
-      for (const p of old.keys()) if (!cur.has(p)) removed.push(p);
+      const cur = new Map((workspace.files ?? []).map((f) => [f.path, f]));
+      const old = new Map((prev.files ?? []).map((f) => [f.path, f]));
+      const added = [];
+      const changed = [];
+      const removed = [];
+      for (const [path, f] of cur) {
+        if (!old.has(path)) added.push(path);
+        else if (old.get(path).size !== f.size || !sameChunks(old.get(path), f)) changed.push(path);
+      }
+      for (const path of old.keys()) if (!cur.has(path)) removed.push(path);
       diff = { added, changed, removed };
-    } catch (e) { diff = { error: e.message }; }
-  }
-  function sameChunks(a, b) {
-    if ((a.chunks||[]).length !== (b.chunks||[]).length) return false;
-    return (a.chunks||[]).every((c, i) => c === (b.chunks||[])[i]);
-  }
-
-  async function showFile(path) {
-    activeFile = path;
-    fileContent = '…';
-    try {
-      const cp = workspace.checkpoint_id;
-      const res = await fetch(`/v1/agents/${id}/checkpoints/${cp}/file?path=${encodeURIComponent(path)}`);
-      if (res.status >= 400) { fileContent = null; return; }
-      const txt = await res.text();
-      // Cap rendered size (the dashboard renders defensively; huge files are truncated).
-      fileContent = txt.length > 200000 ? txt.slice(0, 200000) + `\n… [truncated ${txt.length - 200000} bytes]` : txt;
     } catch (e) {
-      fileContent = `error: ${e.message}`;
+      diff = { error: e.message };
     }
   }
 
-  async function sendInput() {
-    if (!inputBody.trim()) return;
-    busy.input = true; actionErr = null;
+  function sameChunks(a, b) {
+    const ac = a.chunks ?? [];
+    const bc = b.chunks ?? [];
+    return ac.length === bc.length && ac.every((c, i) => c === bc[i]);
+  }
+
+  function toggleDiff() {
+    showDiff = !showDiff;
+    if (showDiff && !diff) loadDiff();
+  }
+
+  const FILE_LIMIT = 200_000;
+
+  async function openFile(path) {
+    activeFile = path;
+    fileLoading = true;
+    fileContent = null;
     try {
-      await api.sendMessage(id, inputBody);
-      inputBody = '';
+      const text = await checkpointFileText(id, workspace.checkpoint_id, path);
+      fileContent =
+        text.length > FILE_LIMIT
+          ? `${text.slice(0, FILE_LIMIT)}\n… [truncated ${(text.length - FILE_LIMIT).toLocaleString()} bytes]`
+          : text;
     } catch (e) {
-      if (e.status === 403) isReadonly = true; else actionErr = e;
-    } finally { busy.input = false; }
+      fileContent = null;
+      toasts.error(`Could not read ${path}`, e, { retry: () => openFile(path) });
+      activeFile = null;
+    } finally {
+      fileLoading = false;
+    }
   }
 
-  async function cancel() {
-    if (!confirm('Cancel this agent?')) return;
-    busy.cancel = true; actionErr = null;
-    try { await api.cancel(id); }
-    catch (e) { if (e.status === 403) isReadonly = true; else actionErr = e; }
-    finally { busy.cancel = false; }
-  }
+  // --- intervention -------------------------------------------------------
+  //
+  // One shape for every action: run it, report the outcome explicitly, and on
+  // a 403 record the refusal so the controls disappear (hidden, not disabled)
+  // and the interface can say a request was refused rather than claiming to
+  // know the credential is read-only.
 
-  async function resolveApproval(aid, decision) {
-    resolving[aid] = true; actionErr = null;
+  async function intervene(key, action, { label, onsuccess }) {
+    busy[key] = true;
     try {
-      await fetch(`/v1/agents/${id}/approvals/${aid}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision })
+      const result = await action();
+      onsuccess?.(result);
+    } catch (e) {
+      if (e.status === 403) {
+        session.noteRefusal(label);
+        toasts.error(`${label} was refused`, e);
+      } else {
+        toasts.error(`Could not ${label}`, e, {
+          retry: () => intervene(key, action, { label, onsuccess })
+        });
+      }
+    } finally {
+      busy[key] = false;
+      confirmOpen = false;
+    }
+  }
+
+  function sendInput() {
+    const body = inputBody.trim();
+    if (!body) return;
+    intervene('input', () => api.sendMessage(id, body), {
+      label: 'send input',
+      onsuccess: () => {
+        inputBody = '';
+        toasts.success('Input sent');
+      }
+    });
+  }
+
+  const confirmCancel = () =>
+    ask({
+      key: 'cancel',
+      title: 'Cancel this agent?',
+      description: `Agent ${id} will stop at its next safe point and move to the cancelled state. Its log and workspace are kept.`,
+      confirmLabel: 'Cancel agent',
+      cancelLabel: 'Keep running',
+      run: () =>
+        intervene('cancel', () => api.cancel(id), {
+          label: 'cancel the agent',
+          onsuccess: () => toasts.success(`Agent ${id} cancelled`)
+        })
+    });
+
+  const confirmRestore = () =>
+    ask({
+      key: 'restore',
+      title: `Restore the workspace to turn ${selectedTurn}?`,
+      description: `This rewrites agent ${id}'s live workspace on disk to the checkpoint recorded at turn ${selectedTurn}. Work done after that turn is not represented in the restored files.`,
+      confirmLabel: 'Restore workspace',
+      run: () =>
+        intervene('restore', () => api.restore(id, workspace.checkpoint_id), {
+          label: 'restore the workspace',
+          onsuccess: () => toasts.success(`Workspace restored to turn ${selectedTurn}`)
+        })
+    });
+
+  const confirmDelete = () =>
+    ask({
+      key: 'delete',
+      title: 'Delete this agent?',
+      description: `Agent ${id} and its durable record are destroyed. This cannot be undone.`,
+      confirmLabel: 'Delete agent',
+      run: () =>
+        intervene('delete', () => api.deleteAgent(id), {
+          label: 'delete the agent',
+          onsuccess: () => {
+            toasts.success(`Agent ${id} deleted`);
+            goto('/');
+          }
+        })
+    });
+
+  function forkHere() {
+    intervene('fork', () => api.fork(id, selectedTurn), {
+      label: 'fork the agent',
+      onsuccess: (forked) =>
+        toasts.success(`Forked at turn ${selectedTurn}`, {
+          description: `New agent ${forked.id}`,
+          href: `/agents/${forked.id}`,
+          hrefLabel: 'Open fork'
+        })
+    });
+  }
+
+  function takeCheckpoint() {
+    intervene('checkpoint', () => api.checkpoint(id), {
+      label: 'take a checkpoint',
+      onsuccess: () => toasts.success('Checkpoint taken')
+    });
+  }
+
+  function resolveApproval(approvalId, decision) {
+    resolving[approvalId] = true;
+    intervene('approval', () => api.resolveApproval(id, approvalId, decision), {
+      label: `${decision === 'approved' ? 'approve' : 'deny'} the request`,
+      onsuccess: () => toasts.success(`Approval ${decision}`)
+    }).finally(() => (resolving[approvalId] = false));
+  }
+
+  // Contextual palette actions. Only what is valid right now is registered, so
+  // the palette can never offer an action whose visible control is hidden.
+  registerPaletteActions(() => {
+    if (!agent || !session.canIntervene) return [];
+    const actions = [
+      { id: 'cancel-agent', label: 'Cancel agent', group: 'Agent', icon: Ban, run: confirmCancel },
+      { id: 'checkpoint-agent', label: 'Take checkpoint', group: 'Agent', icon: Diamond, run: takeCheckpoint },
+      { id: 'delete-agent', label: 'Delete agent', group: 'Agent', icon: Trash2, run: confirmDelete }
+    ];
+    if (selectedTurn != null) {
+      actions.unshift({
+        id: 'fork-agent',
+        label: `Fork at turn ${selectedTurn}`,
+        group: 'Agent',
+        icon: GitFork,
+        run: forkHere
       });
-    } catch (e) { actionErr = e; }
-    finally { resolving[aid] = false; }
-  }
+      if (workspace && !workspace._none) {
+        actions.push({
+          id: 'restore-workspace',
+          label: `Restore workspace to turn ${selectedTurn}`,
+          group: 'Agent',
+          icon: History,
+          run: confirmRestore
+        });
+      }
+    }
+    return actions;
+  });
 
-  function fmtBytes(n) { if (!n) return '–'; const u = ['B','KiB','MiB','GiB']; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
-  function time(t) { return t && !t.startsWith('0001') ? new Date(t).toLocaleTimeString() : ''; }
-
-  function safeMsg(p) {
-    if (!p) return '';
-    let m = p;
-    if (typeof p === 'string') { try { m = JSON.parse(p); } catch (_) { return esc(p); } }
-    const role = m.role || ''; const content = m.content || m.body || '';
-    return `<b>${esc(role)}</b>: ${esc(typeof content === 'string' ? content : JSON.stringify(content))}`;
-  }
-  function pre(p) {
-    if (p === undefined || p === null) return '';
-    if (typeof p === 'string') return p;
-    try { return JSON.stringify(p, null, 2); } catch (_) { return String(p); }
-  }
-  function esc(s) {
-    return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-  }
+  const canRestore = $derived(workspace && !workspace._none && selectedTurn != null);
 </script>
 
-{#if err}
-  <p class="error">⚠ {err.message}{#if err.request_id} <span class="small">(request {err.request_id})</span>{/if}</p>
+<svelte:head><title>{id} — Stonewall</title></svelte:head>
+
+{#if agentError}
+  <div class="mx-auto max-w-2xl pt-8">
+    <ErrorState error={agentError} retry={() => loadAgent(id)} title="Could not load this agent" />
+    <div class="mt-3">
+      <Button variant="outline" size="sm" href="/">
+        <ArrowLeft data-icon="inline-start" />
+        Back to fleet
+      </Button>
+    </div>
+  </div>
 {:else if !agent}
-  <p class="muted">loading…</p>
+  <LoadingState label="Loading agent" />
 {:else}
-  <div class="head">
-    <div>
-      <h1 class="code">{agent.id}</h1>
-      <div class="small muted">
-        <span class="state-pill state-{agent.state}">{agent.state}</span>
-        turn {agent.last_turn}
-        {#if agent.parent_id}<span class="crumb"> · fork of <a href={`/agents/${agent.parent_id}`}>{agent.parent_id}</a> @ turn {agent.parent_turn}</span>{/if}
-        · image {agent.image}
-      </div>
-    </div>
-    <div class="actions">
-      {#if !isReadonly}
-        <input bind:value={inputBody} placeholder="send input…" aria-label="message body" onkeydown={(e) => e.key === 'Enter' && sendInput()} />
-        <button class="btn" onclick={sendInput} disabled={busy.input}>send</button>
-        <button class="btn ghost" onclick={cancel} disabled={busy.cancel}>cancel</button>
-      {:else}
-        <span class="small muted">read-only</span>
-      {/if}
-    </div>
-  </div>
-
-  {#if actionErr}<p class="small error">⚠ {actionErr.message}</p>{/if}
-
-  <div class="config card">
-    <div><span class="muted small">goal</span> {agent.goal || '–'}</div>
-    <div><span class="muted small">model</span> {agent.model || '–'}</div>
-    <div><span class="muted small">isolation</span> {agent.isolation} <span class="muted small">checkpoint {agent.checkpoint}</span></div>
-    <div class="small">
-      <span class="muted">grants</span>
-      <span class="code">fs: {Object.entries(agent.grants?.fs || {}).map(([p, m]) => `${p}:${m}`).join(' ') || 'none'}</span>
-      · <span class="code">net: {(agent.grants?.net || []).join(',') || 'none'}</span>
-      · <span class="code">cmd: {(agent.grants?.cmd || []).join(',') || 'none'}</span>
-      {#if (agent.grants?.cmd || []).some(c => ['python','git','find','awk','xargs','bash','sh','node'].includes(c))}
-        <span class="warn" title="allow-list controls binaries, not behaviour">⚠ broad command grant — effectively everything in the image; the security boundary is the sandbox</span>
-      {/if}
-    </div>
-  </div>
-
-  <div class="grid3">
-    <div class="col col-scroll card">
-      <div class="pane-title">timeline</div>
-      {#if !connected}<div class="small red">● disconnected — reconnecting</div>{/if}
-      {#each turns as e (e.seq)}
-        <button class="tl" class:active={selectedTurn === e.turn} onclick={() => e.turn && selectTurn(e.turn)}>
-          {#if e.kind === 'checkpoint'}◆ ckpt @ turn {e.turn}{:else}{e.kind} {e.turn ?? ''}{/if}
-          <span class="small muted"> {time(e.occurred_at)}</span>
-        </button>
-      {/each}
-      {#if turns.length === 0}<div class="small muted">no turns yet</div>{/if}
-    </div>
-
-    <div class="col col-scroll card">
-      <div class="pane-title">transcript {#if selectedTurn}· turn {selectedTurn}{/if}</div>
-      {#each transcript as e (e.seq)}
-        {#if e.turn <= (selectedTurn ?? Infinity) || !selectedTurn}
-          <div class="ev">
-            <span class="kind">{e.kind}</span>
-            <span class="small muted">seq {e.seq} · turn {e.turn}</span>
-            <div class="payload">
-              {#if e.kind === 'message'}{@html safeMsg(e.payload)}{:else}{pre(e.payload)}{/if}
-            </div>
-          </div>
-        {/if}
-      {/each}
-    </div>
-
-    <div class="col col-scroll card">
-      <div class="pane-title">workspace @ turn {selectedTurn ?? '–'}
-        {#if workspace && !workspace._none && selectedTurn}
-          <button class="mini" class:on={showDiff} onclick={() => { showDiff = !showDiff; if (showDiff && !diff) loadDiff(); }}>diff vs prev</button>
-        {/if}
-      </div>
-      {#if !workspace}<div class="small muted">select a turn</div>
-      {:else if workspace._none}<div class="small muted">no checkpoint at this turn</div>
-      {:else}
-        {#if showDiff && diff}
-          <div class="diff small">
-            {#if diff.none}<span class="muted">no previous checkpoint</span>
-            {:else}
-              {#each diff.added as p}<div class="add">+ {p}</div>{/each}
-              {#each diff.changed as p}<div class="chg">~ {p}</div>{/each}
-              {#each diff.removed as p}<div class="rm">- {p}</div>{/each}
-              {#if !diff.added.length && !diff.changed.length && !diff.removed.length}<span class="muted">no changes</span>{/if}
-            {/if}
-          </div>
-        {/if}
-        <ul class="files">
-          {#each workspace.files as f (f.path)}
-            <li>
-              {#if f.is_dir}<span class="small muted">▸ {f.path}</span>
-              {:else}<button class="file" class:active={activeFile === f.path} onclick={() => showFile(f.path)}>
-                {f.path} <span class="small muted">{fmtBytes(f.size)}</span>
-              </button>{/if}
-            </li>
-          {/each}
-        </ul>
-        {#if fileContent !== null}
-          <pre class="file-content">{fileContent ?? ''}</pre>
-        {/if}
-      {/if}
-    </div>
-  </div>
-
-  <div class="activations card">
-    <div class="pane-title">activations
-      {#if activeActivation}<button class="mini" onclick={() => activeActivation = null}>clear filter</button>{/if}
-    </div>
-    {#each activations as a (a.id)}
-      <button class="act" class:active={activeActivation === a.id} onclick={() => activeActivation = (activeActivation === a.id ? null : a.id)}>
-        <span class="code">#{a.number}</span> {time(a.started_at)} → {a.ended_at ? time(a.ended_at) : '…'} <span class="small muted">{a.end_reason || 'running'}</span>
-      </button>
-    {/each}
-    {#if activations.length === 0}<div class="small muted">none</div>{/if}
-  </div>
-
-  <div class="approvals card">
-    <div class="pane-title">approvals</div>
-    {#if approvals.length === 0}<div class="small muted">none</div>
-    {:else}
-      {#each approvals as a (a.seq)}
-        <div class="approval">
-          <span class="code">{(a.payload?.approval_id) || ('seq' + a.seq)}</span>
-          <span class="small muted">{(a.payload?.decision) || 'pending'}</span>
-          {#if !isReadonly && !a.payload?.decision}
-            <button class="mini" onclick={() => resolveApproval(a.payload?.approval_id || '', 'approved')} disabled={resolving[a.payload?.approval_id]}>approve</button>
-            <button class="mini" onclick={() => resolveApproval(a.payload?.approval_id || '', 'denied')} disabled={resolving[a.payload?.approval_id]}>deny</button>
-          {/if}
+  <div class="mx-auto flex max-w-[110rem] flex-col gap-3">
+    <!-- header -->
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-center gap-2">
+          <h1 class="font-mono text-base font-semibold">{agent.id}</h1>
+          <AgentStateBadge state={agent.state} />
+          <span class="text-muted-foreground text-sm">turn {agent.last_turn}</span>
         </div>
-      {/each}
-    {/if}
+        <p class="text-muted-foreground mt-0.5 text-xs">
+          <span class="font-mono">{agent.image}</span>
+          {#if agent.parent_id}
+            · forked from
+            <a class="underline underline-offset-2" href="/agents/{agent.parent_id}">
+              {agent.parent_id}
+            </a>
+            at turn {agent.parent_turn}
+          {/if}
+        </p>
+      </div>
+
+      {#if session.canIntervene}
+        <div class="flex flex-wrap items-center gap-1.5">
+          <div class="flex items-center gap-1">
+            <Input
+              bind:value={inputBody}
+              placeholder="Send input…"
+              aria-label="Message body"
+              class="h-7 w-56"
+              onkeydown={(e) => e.key === 'Enter' && sendInput()}
+            />
+            <Button size="sm" onclick={sendInput} disabled={busy.input || !inputBody.trim()}>
+              <Send data-icon="inline-start" />
+              Send
+            </Button>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onclick={forkHere}
+            disabled={busy.fork || selectedTurn == null}
+            title={selectedTurn == null ? 'Select a turn to fork at' : `Fork at turn ${selectedTurn}`}
+          >
+            <GitFork data-icon="inline-start" />
+            Fork
+          </Button>
+          <Button variant="outline" size="sm" onclick={takeCheckpoint} disabled={busy.checkpoint}>
+            <Diamond data-icon="inline-start" />
+            Checkpoint
+          </Button>
+          <Button variant="outline" size="sm" onclick={confirmRestore} disabled={!canRestore}>
+            <History data-icon="inline-start" />
+            Restore
+          </Button>
+          <Button variant="outline" size="sm" onclick={confirmCancel} disabled={busy.cancel}>
+            <Ban data-icon="inline-start" />
+            Cancel
+          </Button>
+          <Button variant="destructive" size="sm" onclick={confirmDelete} disabled={busy.delete}>
+            <Trash2 data-icon="inline-start" />
+            Delete
+          </Button>
+        </div>
+      {:else}
+        <p class="text-muted-foreground max-w-sm text-xs">
+          Intervention controls are hidden because a request
+          {session.refusal ? `(${session.refusal.action})` : ''} was refused by the server. That is
+          what the dashboard observed — it does not know what your credential is allowed to do.
+        </p>
+      {/if}
+    </div>
+
+    <AgentConfig {agent} />
+
+    <!-- three panes, keyed by turn -->
+    <div class="hidden h-[calc(100vh-19rem)] min-h-[28rem] xl:block">
+      <Resizable.PaneGroup direction="horizontal" autoSaveId="stonewall.workbench.panes">
+        <Resizable.Pane defaultSize={20} minSize={12} class="rounded-lg border p-2">
+          <Timeline
+            entries={timelineEntries}
+            {selectedTurn}
+            {connected}
+            onselect={selectTurn}
+          />
+        </Resizable.Pane>
+        <Resizable.Handle withHandle class="mx-1.5" />
+        <Resizable.Pane defaultSize={50} minSize={25} class="rounded-lg border p-2">
+          <Transcript events={transcriptEvents} {selectedTurn} />
+        </Resizable.Pane>
+        <Resizable.Handle withHandle class="mx-1.5" />
+        <Resizable.Pane defaultSize={30} minSize={15} class="rounded-lg border p-2">
+          <WorkspacePane
+            {selectedTurn}
+            {workspace}
+            loading={workspaceLoading}
+            error={workspaceError}
+            {diff}
+            {showDiff}
+            {activeFile}
+            {fileContent}
+            {fileLoading}
+            onretry={loadWorkspace}
+            ontogglediff={toggleDiff}
+            onopenfile={openFile}
+            oncloseFile={() => { activeFile = null; fileContent = null; }}
+          />
+        </Resizable.Pane>
+      </Resizable.PaneGroup>
+    </div>
+
+    <!-- below the resizable breakpoint the panes stack; nothing is dropped -->
+    <div class="flex flex-col gap-3 xl:hidden">
+      <div class="max-h-72 rounded-lg border p-2">
+        <Timeline entries={timelineEntries} {selectedTurn} {connected} onselect={selectTurn} />
+      </div>
+      <div class="max-h-[32rem] rounded-lg border p-2">
+        <Transcript events={transcriptEvents} {selectedTurn} />
+      </div>
+      <div class="max-h-[32rem] rounded-lg border p-2">
+        <WorkspacePane
+          {selectedTurn}
+          {workspace}
+          loading={workspaceLoading}
+          error={workspaceError}
+          {diff}
+          {showDiff}
+          {activeFile}
+          {fileContent}
+          {fileLoading}
+          onretry={loadWorkspace}
+          ontogglediff={toggleDiff}
+          onopenfile={openFile}
+          oncloseFile={() => { activeFile = null; fileContent = null; }}
+        />
+      </div>
+    </div>
+
+    <div class="grid gap-3 lg:grid-cols-2">
+      <Activations
+        {activations}
+        active={activeActivation}
+        loading={activationsLoading}
+        error={activationsError}
+        onretry={loadActivations}
+        onselect={(a) => (activeActivation = a)}
+      />
+      <Approvals
+        {approvals}
+        canIntervene={session.canIntervene}
+        {resolving}
+        onresolve={resolveApproval}
+      />
+    </div>
+
+    <p class="text-muted-foreground text-xs">
+      Granted quotas are shown above. Live per-agent CPU and memory are not displayed because the
+      runtime does not sample them — that is a later runtime/telemetry change, not a gap this view
+      fills in with an estimate.
+    </p>
   </div>
 
-  <div class="honesty small muted">
-    resource usage: granted quotas shown where set; live per-agent CPU/memory is not yet measured (runtime samples are a later change).
-  </div>
+  {#if confirm}
+    <ConfirmDialog
+      bind:open={confirmOpen}
+      title={confirm.title}
+      description={confirm.description}
+      confirmLabel={confirm.confirmLabel}
+      cancelLabel={confirm.cancelLabel ?? 'Cancel'}
+      busy={busy[confirm.key]}
+      onconfirm={confirm.run}
+    />
+  {/if}
 {/if}
-
-<style>
-  .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
-  h1 { margin: 0; font-size: 1rem; }
-  .actions { display: flex; gap: 0.4rem; align-items: center; }
-  .actions input { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 0.3rem 0.5rem; width: 16rem; }
-  .config { margin-bottom: 0.5rem; display: flex; flex-direction: column; gap: 0.2rem; }
-  .warn { color: var(--amber); font-size: 0.78rem; margin-left: 0.5rem; }
-  .crumb a { color: var(--accent); }
-  .tl { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--fg); padding: 0.2rem 0.3rem; cursor: pointer; border-radius: 3px; font-size: 0.82rem; }
-  .tl:hover { background: var(--bg); }
-  .tl.active { background: var(--accent); color: #fff; }
-  .ev { padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
-  .ev .kind { font-weight: 600; font-size: 0.8rem; margin-right: 0.4rem; }
-  .payload { white-space: pre-wrap; font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 0.8rem; margin-top: 0.2rem; max-height: 10rem; overflow: auto; }
-  .files { list-style: none; padding: 0; margin: 0; }
-  .file { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0.1rem 0; font-size: 0.82rem; display: block; }
-  .file:hover, .file.active { text-decoration: underline; }
-  .file-content { background: var(--code-bg); padding: 0.5rem; border-radius: 4px; font-size: 0.78rem; max-height: 16rem; overflow: auto; margin: 0.4rem 0 0; }
-  .activations { margin-top: 0.5rem; }
-  .honesty { margin-top: 0.5rem; }
-  .red { color: var(--red); }
-  .error { color: var(--red); }
-  .mini { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 3px; padding: 0 0.4rem; font-size: 0.72rem; cursor: pointer; margin-left: 0.4rem; }
-  .mini:hover { color: var(--fg); border-color: var(--fg); }
-  .mini.on { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .diff { margin: 0.3rem 0; padding: 0.3rem; background: var(--bg); border-radius: 4px; }
-  .diff .add { color: var(--green); }
-  .diff .chg { color: var(--amber); }
-  .diff .rm { color: var(--red); }
-  .act { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--fg); padding: 0.15rem 0.3rem; cursor: pointer; border-radius: 3px; font-size: 0.82rem; }
-  .act:hover, .act.active { background: var(--bg); }
-  .approval { padding: 0.15rem 0; font-size: 0.82rem; display: flex; gap: 0.4rem; align-items: center; }
-</style>
