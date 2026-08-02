@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "contrast": "node scripts/contrast.mjs",
-    "test": "node --test \"src/**/*.test.js\""
+    "test": "node --test \"src/**/*.test.js\"",
+    "verify": "node scripts/verify-passes.mjs"
   },
   "devDependencies": {
     "@internationalized/date": "^3.12.3",

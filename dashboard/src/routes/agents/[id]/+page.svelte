@@ -10,7 +10,7 @@
   // durable log over SSE, and EventSource's own Last-Event-ID reconnect is the
   // resume mechanism — there is no separate "archive mode" for a terminal
   // agent.
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { api, checkpointFileBlob } from '$lib/api.js';
@@ -105,10 +105,16 @@
   // agent's stream, so everything resets on id change.
   $effect(() => {
     const agentId = id;
-    reset();
-    loadAgent(agentId);
-    loadActivations(agentId);
-    connectEvents(agentId);
+    // Only the agent id may re-run this. The body reads other state — `reset()`
+    // reaches `file` to revoke an object URL — and without `untrack` those
+    // reads become dependencies, so opening a workspace file tore the whole
+    // workbench down and reconnected the event stream mid-render.
+    untrack(() => {
+      reset();
+      loadAgent(agentId);
+      loadActivations(agentId);
+      connectEvents(agentId);
+    });
     return () => {
       refreshAgent.cancel();
       es?.close();
