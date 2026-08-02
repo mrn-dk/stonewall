@@ -7,6 +7,7 @@
   // in order to search it.
   import { api } from '$lib/api.js';
   import { page } from '$app/state';
+  import { startPolling } from '$lib/live.svelte.js';
   import { toasts } from '$lib/toasts.svelte.js';
   import NodeStatsStrip from '$lib/components/node-stats-strip.svelte';
   import AgentTable from '$lib/components/agent-table.svelte';
@@ -53,17 +54,26 @@
   // A stamp per request: a slow earlier response must never overwrite a newer
   // one when the operator keeps typing.
   let seq = 0;
+  // Rows the operator has pulled in with "load more". A background refresh has
+  // to fetch at least this many or it would silently throw those pages away.
+  let loadedCount = $state(PAGE_SIZE);
 
   $effect(() => {
     void activeState;
     void query;
+    loadedCount = PAGE_SIZE;
     load();
   });
 
   $effect(() => {
     loadStats();
+    // Refresh often enough that the fleet feels live, rarely enough that an
+    // idle dashboard is not a load source. Polling because the API has no
+    // fleet-wide event stream — per-agent SSE only.
+    return startPolling(refresh, 4000);
   });
 
+  /** Foreground load: may show a loading state and may surface an error. */
   async function load() {
     const mine = ++seq;
     loading = true;
@@ -78,6 +88,32 @@
       err = e;
     } finally {
       if (mine === seq) loading = false;
+    }
+  }
+
+  /**
+   * Background refresh. Deliberately unlike `load`: it never sets `loading`,
+   * so a populated table does not flash; it re-requests everything the
+   * operator has paged in; and on failure it leaves the last good data alone.
+   * A blip in a poll is not a reason to replace a working view with an error.
+   */
+  async function refresh() {
+    const mine = ++seq;
+    try {
+      const [list, node] = await Promise.all([
+        api.listAgents({ state: activeState, q: query, limit: loadedCount }),
+        api.nodeStats().catch(() => null)
+      ]);
+      if (mine !== seq) return;
+      agents = list.agents || [];
+      next = list.next_cursor || '';
+      err = null;
+      if (node) {
+        stats = node;
+        statsError = null;
+      }
+    } catch {
+      // Intentionally silent: keep showing what we have.
     }
   }
 
@@ -103,6 +139,7 @@
       });
       agents = [...agents, ...(res.agents || [])];
       next = res.next_cursor || '';
+      loadedCount = agents.length;
     } catch (e) {
       toasts.error('Could not load more agents', e, { retry: more });
     } finally {

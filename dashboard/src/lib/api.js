@@ -78,18 +78,22 @@ export const api = {
 
 /**
  * Fetches one file's contents from a checkpoint. Kept outside `api` because it
- * returns text, not JSON, and the caller wants the raw body.
+ * returns bytes, not JSON. A Blob rather than text: the caller decides whether
+ * these bytes are text, an image, or binary, and that decision needs the bytes
+ * themselves — decoding to a string first would destroy the evidence.
  */
-export async function checkpointFileText(id, ckpt, path) {
+export async function checkpointFileBlob(id, ckpt, path) {
   const token = authToken();
   const res = await fetch(
     `/v1/agents/${id}/checkpoints/${ckpt}/file?path=${encodeURIComponent(path)}`,
     { headers: token ? { Authorization: `Bearer ${token}` } : {} }
   );
   if (!res.ok) {
-    const e = new Error(res.statusText);
+    const err = await res.json().catch(() => ({}));
+    const e = new Error(err.message || res.statusText);
     e.status = res.status;
+    e.request_id = err.request_id;
     throw e;
   }
-  return res.text();
+  return res.blob();
 }

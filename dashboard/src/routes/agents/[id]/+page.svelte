@@ -13,10 +13,12 @@
   import { onDestroy } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, checkpointFileText } from '$lib/api.js';
+  import { api, checkpointFileBlob } from '$lib/api.js';
+  import { isImage } from '$lib/files.js';
   import { session } from '$lib/session.svelte.js';
   import { toasts } from '$lib/toasts.svelte.js';
   import { registerPaletteActions } from '$lib/palette.svelte.js';
+  import { coalesce } from '$lib/live.svelte.js';
 
   import * as Resizable from '$lib/components/ui/resizable/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -58,7 +60,8 @@
   let showDiff = $state(false);
   let diff = $state(null);
   let activeFile = $state(null);
-  let fileContent = $state(null);
+  /** @type {{ kind: 'text'|'image'|'binary', content?: string, imageUrl?: string, size: number, truncated: boolean } | null} */
+  let file = $state(null);
   let fileLoading = $state(false);
 
   let inputBody = $state('');
@@ -84,7 +87,10 @@
   }
 
   let es = null;
-  onDestroy(() => es?.close());
+  onDestroy(() => {
+    es?.close();
+    releaseFile();
+  });
 
   // Re-entering the workbench for a different agent must not show the previous
   // agent's stream, so everything resets on id change.
@@ -95,6 +101,7 @@
     loadActivations(agentId);
     connectEvents(agentId);
     return () => {
+      refreshAgent.cancel();
       es?.close();
       es = null;
     };
@@ -114,31 +121,32 @@
     workspaceError = null;
     diff = null;
     showDiff = false;
-    activeFile = null;
-    fileContent = null;
+    closeFile();
     es?.close();
     es = null;
   }
 
-  async function loadAgent(agentId) {
+  async function loadAgent(agentId, { background = false } = {}) {
     try {
       agent = await api.getAgent(agentId);
       agentError = null;
     } catch (e) {
+      // A failed background refresh keeps the agent we already have on screen.
+      if (background) return;
       agentError = e.status === 404 ? { message: 'Agent not found', request_id: e.request_id } : e;
     }
   }
 
-  async function loadActivations(agentId = id) {
-    activationsLoading = true;
+  async function loadActivations(agentId = id, { background = false } = {}) {
+    if (!background) activationsLoading = true;
     try {
       const res = await api.activations(agentId);
       activations = res.activations || [];
       activationsError = null;
     } catch (e) {
-      activationsError = e;
+      if (!background) activationsError = e;
     } finally {
-      activationsLoading = false;
+      if (!background) activationsLoading = false;
     }
   }
 
@@ -151,6 +159,13 @@
     'checkpoint', 'message', 'egress', 'approval', 'fork', 'workspace_modified'
   ];
 
+  // A run emits several events in quick succession; refetching per event would
+  // be a burst of redundant requests. Coalesce to one refresh per quiet moment.
+  const refreshAgent = coalesce(() => {
+    loadAgent(id, { background: true });
+    loadActivations(id, { background: true });
+  }, 400);
+
   function connectEvents(agentId) {
     es = api.events(agentId, 0);
     es.onopen = () => (connected = true);
@@ -159,7 +174,12 @@
       const parsed = JSON.parse(ev.data);
       events = [...events, parsed];
       if (parsed.kind === 'turn' && selectedTurn == null) selectTurn(parsed.turn);
-      if (parsed.kind === 'run_end') loadActivations();
+      // The event log says what happened; the agent resource says what the
+      // agent now *is* (state, last turn). Keep both current, or the header
+      // goes stale while the transcript scrolls on.
+      if (['turn', 'run_start', 'run_end', 'fork', 'checkpoint'].includes(parsed.kind)) {
+        refreshAgent();
+      }
     };
     KINDS.forEach((k) => es.addEventListener(k, onEvent));
   }
@@ -186,8 +206,7 @@
 
   async function selectTurn(turn) {
     selectedTurn = turn;
-    activeFile = null;
-    fileContent = null;
+    closeFile();
     diff = null;
     showDiff = false;
     await loadWorkspace();
@@ -247,23 +266,61 @@
 
   const FILE_LIMIT = 200_000;
 
+  /**
+   * Reads a file from the checkpoint and decides how to present it. The API
+   * returns bytes; what those bytes *are* is a client-side question, so it is
+   * answered here rather than guessed from the extension alone — an extension
+   * says "png", a failed UTF-8 decode says "not text", and the second is the
+   * one that matters for whether a text pane would be gibberish.
+   */
   async function openFile(path) {
+    // Revoke the previous object URL before replacing it, or every file opened
+    // leaks a blob for the lifetime of the page.
+    releaseFile();
     activeFile = path;
     fileLoading = true;
-    fileContent = null;
+    file = null;
     try {
-      const text = await checkpointFileText(id, workspace.checkpoint_id, path);
-      fileContent =
-        text.length > FILE_LIMIT
-          ? `${text.slice(0, FILE_LIMIT)}\n… [truncated ${(text.length - FILE_LIMIT).toLocaleString()} bytes]`
-          : text;
+      const blob = await checkpointFileBlob(id, workspace.checkpoint_id, path);
+      const size = blob.size;
+
+      if (isImage(path)) {
+        file = { kind: 'image', imageUrl: URL.createObjectURL(blob), size, truncated: false };
+        return;
+      }
+
+      const text = await blob.text();
+      // A NUL byte or a replacement character means the decode did not survive:
+      // treat it as binary rather than rendering mojibake.
+      if (/\u0000/.test(text) || text.includes('\uFFFD')) {
+        file = { kind: 'binary', size, truncated: false };
+        return;
+      }
+
+      const truncated = text.length > FILE_LIMIT;
+      file = {
+        kind: 'text',
+        content: truncated ? text.slice(0, FILE_LIMIT) : text,
+        size,
+        truncated
+      };
     } catch (e) {
-      fileContent = null;
-      toasts.error(`Could not read ${path}`, e, { retry: () => openFile(path) });
       activeFile = null;
+      file = null;
+      toasts.error(`Could not read ${path}`, e, { retry: () => openFile(path) });
     } finally {
       fileLoading = false;
     }
+  }
+
+  function releaseFile() {
+    if (file?.imageUrl) URL.revokeObjectURL(file.imageUrl);
+  }
+
+  function closeFile() {
+    releaseFile();
+    activeFile = null;
+    file = null;
   }
 
   // --- intervention -------------------------------------------------------
@@ -522,12 +579,12 @@
             {diff}
             {showDiff}
             {activeFile}
-            {fileContent}
+            {file}
             {fileLoading}
             onretry={loadWorkspace}
             ontogglediff={toggleDiff}
             onopenfile={openFile}
-            oncloseFile={() => { activeFile = null; fileContent = null; }}
+            oncloseFile={closeFile}
           />
         </Resizable.Pane>
       </Resizable.PaneGroup>
@@ -550,12 +607,12 @@
           {diff}
           {showDiff}
           {activeFile}
-          {fileContent}
+          {file}
           {fileLoading}
           onretry={loadWorkspace}
           ontogglediff={toggleDiff}
           onopenfile={openFile}
-          oncloseFile={() => { activeFile = null; fileContent = null; }}
+          oncloseFile={closeFile}
         />
       </div>
     </div>

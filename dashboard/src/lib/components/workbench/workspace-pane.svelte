@@ -5,12 +5,13 @@
   // behind a confirmation.
   import { Button } from '$lib/components/ui/button/index.js';
   import { fmtBytes } from '$lib/agents.js';
+  import { buildTree, totalSize } from '$lib/files.js';
+  import FileTree from './file-tree.svelte';
+  import FileViewer from './file-viewer.svelte';
   import LoadingState from '$lib/components/states/loading-state.svelte';
   import ErrorState from '$lib/components/states/error-state.svelte';
-  import FileText from '@lucide/svelte/icons/file-text';
-  import Folder from '@lucide/svelte/icons/folder';
   import GitCompare from '@lucide/svelte/icons/git-compare';
-  import X from '@lucide/svelte/icons/x';
+  import { SvelteSet } from 'svelte/reactivity';
 
   let {
     selectedTurn,
@@ -20,13 +21,44 @@
     diff,
     showDiff,
     activeFile,
-    fileContent,
+    file,
     fileLoading,
     onretry,
     ontogglediff,
     onopenfile,
     oncloseFile
   } = $props();
+
+  const files = $derived(workspace?.files ?? []);
+  const tree = $derived(buildTree(files));
+  const fileCount = $derived(files.filter((f) => !f.is_dir).length);
+
+  // Directories start expanded: a checkpoint is usually small, and a tree that
+  // opens closed makes you click to discover it is not empty.
+  let expanded = $state(new SvelteSet());
+  let lastCheckpoint = $state(null);
+
+  $effect(() => {
+    const ckpt = workspace?.checkpoint_id ?? null;
+    if (ckpt === lastCheckpoint) return;
+    lastCheckpoint = ckpt;
+    const dirs = new SvelteSet();
+    const walk = (nodes) => {
+      for (const n of nodes) {
+        if (n.type === 'dir') {
+          dirs.add(n.path);
+          walk(n.sorted);
+        }
+      }
+    };
+    walk(tree);
+    expanded = dirs;
+  });
+
+  function toggle(path) {
+    if (expanded.has(path)) expanded.delete(path);
+    else expanded.add(path);
+  }
 
   const diffRows = $derived(
     diff && !diff.none && !diff.error
@@ -90,7 +122,7 @@
           {:else if diffRows.length === 0}
             <span class="text-muted-foreground">No file changes since the previous checkpoint.</span>
           {:else}
-            <ul class="space-y-0.5 font-mono">
+            <ul class="list-none space-y-0.5 font-mono">
               {#each diffRows as [kind, path] (kind + path)}
                 <li class={diffTone[kind]}>
                   <span aria-hidden="true">{diffMark[kind]}</span>
@@ -103,61 +135,32 @@
         </div>
       {/if}
 
-      <ul class="space-y-px">
-        {#each workspace.files ?? [] as f (f.path)}
-          <li>
-            {#if f.is_dir}
-              <span class="text-muted-foreground flex items-center gap-1.5 px-1.5 py-0.5 text-xs">
-                <Folder class="size-3 shrink-0" />
-                <span class="truncate font-mono">{f.path}</span>
-              </span>
-            {:else}
-              <button
-                type="button"
-                class="flex w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-xs transition-colors {activeFile ===
-                f.path
-                  ? 'bg-secondary text-secondary-foreground'
-                  : 'hover:bg-muted'}"
-                aria-pressed={activeFile === f.path}
-                onclick={() => onopenfile(f.path)}
-              >
-                <FileText class="text-muted-foreground size-3 shrink-0" />
-                <span class="truncate font-mono">{f.path}</span>
-                <span class="text-muted-foreground ml-auto shrink-0 tabular-nums">
-                  {fmtBytes(f.size)}
-                </span>
-              </button>
-            {/if}
-          </li>
-        {:else}
-          <li class="text-muted-foreground px-1.5 py-3 text-sm">
-            This checkpoint contains no files.
-          </li>
-        {/each}
-      </ul>
+      {#if fileCount === 0}
+        <p class="text-muted-foreground px-1.5 py-3 text-sm">This checkpoint contains no files.</p>
+      {:else}
+        <FileTree
+          nodes={tree}
+          {activeFile}
+          {expanded}
+          onopen={onopenfile}
+          ontoggle={toggle}
+        />
+        <p class="text-muted-foreground mt-1.5 border-t px-1.5 pt-1.5 text-[0.7rem] tabular-nums">
+          {fileCount} file{fileCount === 1 ? '' : 's'} · {fmtBytes(totalSize(files))}
+        </p>
+      {/if}
 
       {#if activeFile}
-        <div class="mt-2 rounded-md border">
-          <div class="flex items-center gap-2 border-b px-2 py-1">
-            <span class="truncate font-mono text-xs">{activeFile}</span>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              class="ml-auto"
-              onclick={oncloseFile}
-              aria-label="Close file"
-            >
-              <X />
-            </Button>
-          </div>
-          {#if fileLoading}
-            <LoadingState label="Reading file" class="px-2" />
-          {:else}
-            <pre
-              class="bg-muted/50 scrollbar-thin max-h-80 overflow-auto p-2 font-mono text-xs break-words whitespace-pre-wrap">{fileContent ??
-                ''}</pre>
-          {/if}
-        </div>
+        <FileViewer
+          path={activeFile}
+          content={file?.content}
+          kind={file?.kind}
+          imageUrl={file?.imageUrl}
+          size={file?.size}
+          truncated={file?.truncated}
+          loading={fileLoading}
+          onclose={oncloseFile}
+        />
       {/if}
     {/if}
   </div>
