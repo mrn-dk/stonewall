@@ -57,8 +57,16 @@ original, or restore it to an earlier checkpoint:
 
 ```
 curl :8080/v1/agents/<id>/fork     -d '{"at_turn": 12}'
+curl :8080/v1/agents/<id>/fork     -d '{"seq": 148}'
 curl :8080/v1/agents/<id>/restore  -d '{"checkpoint_id": "<ckpt>"}'
 ```
+
+`at_turn=N` is the Nth turn boundary in the agent's log, counted across all of
+its activations — the turn ordinal is assigned by the store, so it never
+restarts when an agent is woken. The sequence number of that boundary is the
+same address, for callers that already hold one; both are accepted wherever a
+turn is (fork, and `GET /v1/agents/<id>/workspace?at_turn=N`). A turn the agent
+has not reached is not-found rather than the nearest match.
 
 ## Dashboard
 
