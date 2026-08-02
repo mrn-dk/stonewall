@@ -1,17 +1,29 @@
 <script>
-  import { api, session } from '$lib/api.js';
   import '../app.css';
 
-  let token = session().token;
-  $: session(token);
+  let token = $state(localStorage.getItem('stonewall.token') ?? '');
 
   function setToken(e) {
     token = e.currentTarget.value.trim();
+    if (token) localStorage.setItem('stonewall.token', token);
+    else localStorage.removeItem('stonewall.token');
   }
   function clearToken() {
     token = '';
-    session(null);
+    localStorage.removeItem('stonewall.token');
   }
+  function toggleTheme() {
+    const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+    localStorage.setItem('stonewall.theme', t);
+  }
+  // Restore saved theme on first paint.
+  if (typeof localStorage !== 'undefined') {
+    const saved = localStorage.getItem('stonewall.theme');
+    if (saved) document.documentElement.dataset.theme = saved;
+  }
+
+  let { children } = $props();
 </script>
 
 <div class="app">
@@ -29,7 +41,7 @@
           type="password"
           placeholder="API token (optional)"
           value={token}
-          on:input={setToken}
+          oninput={setToken}
           aria-label="API token"
         />
       {/if}
@@ -38,21 +50,9 @@
   </header>
 
   <main>
-    <slot />
+    {@render children()}
   </main>
 </div>
-
-<script context="module">
-  function toggleTheme() {
-    const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = t;
-    localStorage.setItem('stonewall.theme', t);
-  }
-  if (typeof localStorage !== 'undefined') {
-    const saved = localStorage.getItem('stonewall.theme');
-    if (saved) document.documentElement.dataset.theme = saved;
-  }
-</script>
 
 <style>
   .app { min-height: 100vh; display: flex; flex-direction: column; }

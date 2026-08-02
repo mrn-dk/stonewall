@@ -4,24 +4,24 @@
   import { page } from '$app/stores';
 
   let id = $page.params.id;
-  let agent = null;
-  let activations = [];
-  let events = [];
-  let selectedTurn = null;
-  let workspace = null;
-  let fileContent = null;
-  let activeFile = null;
+  let agent = $state(null);
+  let activations = $state([]);
+  let events = $state([]);
+  let selectedTurn = $state(null);
+  let workspace = $state(null);
+  let fileContent = $state(null);
+  let activeFile = $state(null);
   let es = null;
-  let connected = true;
-  let err = null;
-  let actionErr = null;
-  let busy = { input: false, cancel: false };
-  let inputBody = '';
-  let isReadonly = false;
-  let activeActivation = null; // filter timeline/transcript to one activation
-  let showDiff = false;
-  let diff = null; // {added:[], changed:[], removed:[]}
-  let resolving = {};
+  let connected = $state(true);
+  let err = $state(null);
+  let actionErr = $state(null);
+  let busy = $state({ input: false, cancel: false });
+  let inputBody = $state('');
+  let isReadonly = $state(false);
+  let activeActivation = $state(null);
+  let showDiff = $state(false);
+  let diff = $state(null);
+  let resolving = $state({});
 
   onMount(load);
   onDestroy(() => es && es.close());
@@ -32,9 +32,6 @@
         api.getAgent(id),
         api.activations(id).then(r => r.activations || []).catch(() => [])
       ]);
-      // Stream events (the durable log). Resume from the last seq we have.
-      const firstBatch = await api.listAgents(`?limit=1`).catch(() => null);
-      void firstBatch;
       connectEvents(0);
     } catch (e) {
       if (e.status === 404) err = { message: 'agent not found', request_id: e.request_id };
@@ -42,23 +39,40 @@
     }
   }
 
+  // The SSE server emits NAMED events (event: turn, event: llm_call, ...), so a
+  // generic `message` listener never fires. Bind the handler to each kind.
+  // EventSource auto-reconnects and sends Last-Event-ID, which the server reads
+  // to resume — so we open one stream at after=0 and let it run.
+  const KINDS = ['run_start','run_end','turn','llm_call','tool_intent','tool_result','checkpoint','message','egress','approval','fork','workspace_modified'];
+
+  function onEvent(e) {
+    const ev = JSON.parse(e.data);
+    events = [...events, ev];
+    if (ev.kind === 'turn' && selectedTurn == null) selectedTurn = ev.turn;
+  }
+
   function connectEvents(after) {
     es = api.events(id, after);
     es.onopen = () => (connected = true);
     es.onerror = () => (connected = false);
-    es.addEventListener('message', (e) => {
-      const ev = JSON.parse(e.data);
-      events = [...events, ev];
-      if (ev.kind === 'turn') selectedTurn = selectedTurn ?? ev.turn;
-      es.close();
-      connectEvents(ev.seq);
-    });
+    KINDS.forEach(k => es.addEventListener(k, onEvent));
   }
 
-  $: turns = buildTimeline(events, activeActivation);
-  $: transcript = events.filter(isConversational).filter(e => !activeActivation || e.activation_id === activeActivation);
-  $: lastSeq = events.length ? events[events.length - 1].seq : 0;
-  $: approvals = events.filter(e => e.kind === 'approval');
+  // Derived views: turn is the join key across the three columns.
+  let turns = $derived(buildTimeline(events, activeActivation));
+  let transcript = $derived(
+    events
+      .filter(isConversational)
+      .filter(e => !activeActivation || e.activation_id === activeActivation)
+  );
+  let approvals = $derived(events.filter(e => e.kind === 'approval'));
+
+  // Auto-load the workspace once a turn is first selected (from the first turn event).
+  $effect(() => {
+    if (selectedTurn != null && workspace == null) {
+      selectTurn(selectedTurn);
+    }
+  });
 
   function buildTimeline(evs, act) {
     const out = [];
@@ -108,7 +122,7 @@
   }
   function sameChunks(a, b) {
     if ((a.chunks||[]).length !== (b.chunks||[]).length) return false;
-    return (a.chunks||[]).every((c,i) => c === (b.chunks||[])[i]);
+    return (a.chunks||[]).every((c, i) => c === (b.chunks||[])[i]);
   }
 
   async function showFile(path) {
@@ -156,8 +170,24 @@
     finally { resolving[aid] = false; }
   }
 
-  function fmtBytes(n) { if (!n) return '–'; const u = ['B','KiB','MiB','GiB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return `${n.toFixed(i?1:0)} ${u[i]}`; }
+  function fmtBytes(n) { if (!n) return '–'; const u = ['B','KiB','MiB','GiB']; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return `${n.toFixed(i ? 1 : 0)} ${u[i]}`; }
   function time(t) { return t && !t.startsWith('0001') ? new Date(t).toLocaleTimeString() : ''; }
+
+  function safeMsg(p) {
+    if (!p) return '';
+    let m = p;
+    if (typeof p === 'string') { try { m = JSON.parse(p); } catch (_) { return esc(p); } }
+    const role = m.role || ''; const content = m.content || m.body || '';
+    return `<b>${esc(role)}</b>: ${esc(typeof content === 'string' ? content : JSON.stringify(content))}`;
+  }
+  function pre(p) {
+    if (p === undefined || p === null) return '';
+    if (typeof p === 'string') return p;
+    try { return JSON.stringify(p, null, 2); } catch (_) { return String(p); }
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  }
 </script>
 
 {#if err}
@@ -177,7 +207,7 @@
     </div>
     <div class="actions">
       {#if !isReadonly}
-        <input bind:value={inputBody} placeholder="send input…" aria-label="message body" on:keydown={(e)=>e.key==='Enter'&&sendInput()} />
+        <input bind:value={inputBody} placeholder="send input…" aria-label="message body" onkeydown={(e) => e.key === 'Enter' && sendInput()} />
         <button class="btn" onclick={sendInput} disabled={busy.input}>send</button>
         <button class="btn ghost" onclick={cancel} disabled={busy.cancel}>cancel</button>
       {:else}
@@ -194,10 +224,10 @@
     <div><span class="muted small">isolation</span> {agent.isolation} <span class="muted small">checkpoint {agent.checkpoint}</span></div>
     <div class="small">
       <span class="muted">grants</span>
-      <span class="code">fs: {Object.entries(agent.grants?.fs||{}).map(([p,m])=>`${p}:${m}`).join(' ')||'none'}</span>
-      · <span class="code">net: {(agent.grants?.net||[]).join(',')||'none'}</span>
-      · <span class="code">cmd: {(agent.grants?.cmd||[]).join(',')||'none'}</span>
-      {#if (agent.grants?.cmd||[]).some(c=>['python','git','find','awk','xargs','bash','sh','node'].includes(c))}
+      <span class="code">fs: {Object.entries(agent.grants?.fs || {}).map(([p, m]) => `${p}:${m}`).join(' ') || 'none'}</span>
+      · <span class="code">net: {(agent.grants?.net || []).join(',') || 'none'}</span>
+      · <span class="code">cmd: {(agent.grants?.cmd || []).join(',') || 'none'}</span>
+      {#if (agent.grants?.cmd || []).some(c => ['python','git','find','awk','xargs','bash','sh','node'].includes(c))}
         <span class="warn" title="allow-list controls binaries, not behaviour">⚠ broad command grant — effectively everything in the image; the security boundary is the sandbox</span>
       {/if}
     </div>
@@ -208,7 +238,7 @@
       <div class="pane-title">timeline</div>
       {#if !connected}<div class="small red">● disconnected — reconnecting</div>{/if}
       {#each turns as e (e.seq)}
-        <button class="tl" class:active={selectedTurn===e.turn} onclick={() => e.turn && selectTurn(e.turn)}>
+        <button class="tl" class:active={selectedTurn === e.turn} onclick={() => e.turn && selectTurn(e.turn)}>
           {#if e.kind === 'checkpoint'}◆ ckpt @ turn {e.turn}{:else}{e.kind} {e.turn ?? ''}{/if}
           <span class="small muted"> {time(e.occurred_at)}</span>
         </button>
@@ -255,7 +285,7 @@
           {#each workspace.files as f (f.path)}
             <li>
               {#if f.is_dir}<span class="small muted">▸ {f.path}</span>
-              {:else}<button class="file" class:active={activeFile===f.path} onclick={() => showFile(f.path)}>
+              {:else}<button class="file" class:active={activeFile === f.path} onclick={() => showFile(f.path)}>
                 {f.path} <span class="small muted">{fmtBytes(f.size)}</span>
               </button>{/if}
             </li>
@@ -273,8 +303,8 @@
       {#if activeActivation}<button class="mini" onclick={() => activeActivation = null}>clear filter</button>{/if}
     </div>
     {#each activations as a (a.id)}
-      <button class="act" class:active={activeActivation===a.id} onclick={() => activeActivation = (activeActivation===a.id ? null : a.id)}>
-        <span class="code">#{a.number}</span> {time(a.started_at)} → {a.ended_at ? time(a.ended_at) : '…'} <span class="small muted">{a.end_reason||'running'}</span>
+      <button class="act" class:active={activeActivation === a.id} onclick={() => activeActivation = (activeActivation === a.id ? null : a.id)}>
+        <span class="code">#{a.number}</span> {time(a.started_at)} → {a.ended_at ? time(a.ended_at) : '…'} <span class="small muted">{a.end_reason || 'running'}</span>
       </button>
     {/each}
     {#if activations.length === 0}<div class="small muted">none</div>{/if}
@@ -286,7 +316,7 @@
     {:else}
       {#each approvals as a (a.seq)}
         <div class="approval">
-          <span class="code">{(a.payload?.approval_id) || ('seq'+a.seq)}</span>
+          <span class="code">{(a.payload?.approval_id) || ('seq' + a.seq)}</span>
           <span class="small muted">{(a.payload?.decision) || 'pending'}</span>
           {#if !isReadonly && !a.payload?.decision}
             <button class="mini" onclick={() => resolveApproval(a.payload?.approval_id || '', 'approved')} disabled={resolving[a.payload?.approval_id]}>approve</button>
@@ -301,24 +331,6 @@
     resource usage: granted quotas shown where set; live per-agent CPU/memory is not yet measured (runtime samples are a later change).
   </div>
 {/if}
-
-<script context="module">
-  function safeMsg(p) {
-    if (!p) return '';
-    let m = p;
-    if (typeof p === 'string') { try { m = JSON.parse(p); } catch (_) { return esc(p); } }
-    const role = m.role || ''; const content = m.content || m.body || '';
-    return `<b>${esc(role)}</b>: ${esc(typeof content === 'string' ? content : JSON.stringify(content))}`;
-  }
-  function pre(p) {
-    if (p === undefined || p === null) return '';
-    if (typeof p === 'string') return p;
-    try { return JSON.stringify(p, null, 2); } catch (_) { return String(p); }
-  }
-  function esc(s) {
-    return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-  }
-</script>
 
 <style>
   .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
@@ -339,7 +351,6 @@
   .file:hover, .file.active { text-decoration: underline; }
   .file-content { background: var(--code-bg); padding: 0.5rem; border-radius: 4px; font-size: 0.78rem; max-height: 16rem; overflow: auto; margin: 0.4rem 0 0; }
   .activations { margin-top: 0.5rem; }
-  .act { font-size: 0.82rem; padding: 0.1rem 0; }
   .honesty { margin-top: 0.5rem; }
   .red { color: var(--red); }
   .error { color: var(--red); }

@@ -16,7 +16,7 @@ const config = {
     // The API and dashboard are served from the same origin; the dashboard
     // talks to the control plane at /v1. No separate dev proxy needed for the
     // embedded deployment, but enable one for `npm run dev`.
-    csrf: { checkOrigin: false }
+    csrf: { trustedOrigins: ['*'] }
   }
 };
 

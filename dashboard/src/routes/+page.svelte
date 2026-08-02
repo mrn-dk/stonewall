@@ -3,12 +3,19 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
 
-  let agents = [];
-  let stats = null;
-  let loading = true;
-  let err = null;
-  let cursor = '';
-  let next = null;
+  let agents = $state([]);
+  let stats = $state(null);
+  let loading = $state(true);
+  let err = $state(null);
+  let next = $state('');
+
+  let counts = $derived(
+    agents.reduce((c, a) => {
+      c[a.state] = (c[a.state] || 0) + 1;
+      c.total = (c.total || 0) + 1;
+      return c;
+    }, {})
+  );
 
   onMount(load);
 
@@ -33,12 +40,6 @@
     next = list.next_cursor || '';
   }
 
-  $: counts = agents.reduce((c, a) => {
-    c[a.state] = (c[a.state] || 0) + 1;
-    c.total = (c.total || 0) + 1;
-    return c;
-  }, {});
-
   function open(a) { goto(`/agents/${a.id}`); }
   function fmtBytes(n) {
     if (!n) return '–';
@@ -59,7 +60,6 @@
     const cmd = (a.grants?.cmd || []).join(',');
     return [fs, cmd ? `cmd:${cmd}` : ''].filter(Boolean).join(' ');
   }
-  function readonly() { return false; } // API will 403 mutations; UI hides on 403
 </script>
 
 <section>
@@ -93,7 +93,7 @@
       <tbody>
         {#each agents as a (a.id)}
           <tr class="row" onclick={() => open(a)} tabindex="0"
-              on:keydown={(e) => (e.key === 'Enter' && open(a))}>
+              onkeydown={(e) => (e.key === 'Enter' && open(a))}>
             <td class="code">{a.id}</td>
             <td><span class="state-pill state-{a.state}">{a.state}</span></td>
             <td class="small">{(a.goal || '').slice(0, 48)}</td>
