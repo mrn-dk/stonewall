@@ -18,6 +18,10 @@
   let busy = { input: false, cancel: false };
   let inputBody = '';
   let isReadonly = false;
+  let activeActivation = null; // filter timeline/transcript to one activation
+  let showDiff = false;
+  let diff = null; // {added:[], changed:[], removed:[]}
+  let resolving = {};
 
   onMount(load);
   onDestroy(() => es && es.close());
@@ -51,13 +55,15 @@
     });
   }
 
-  $: turns = buildTimeline(events);
-  $: transcript = events.filter(isConversational);
+  $: turns = buildTimeline(events, activeActivation);
+  $: transcript = events.filter(isConversational).filter(e => !activeActivation || e.activation_id === activeActivation);
   $: lastSeq = events.length ? events[events.length - 1].seq : 0;
+  $: approvals = events.filter(e => e.kind === 'approval');
 
-  function buildTimeline(evs) {
+  function buildTimeline(evs, act) {
     const out = [];
     for (const e of evs) {
+      if (act && e.activation_id && e.activation_id !== act) continue;
       if (e.kind === 'turn' || e.kind === 'run_start' || e.kind === 'run_end' || e.kind === 'checkpoint') {
         out.push(e);
       }
@@ -71,12 +77,38 @@
   async function selectTurn(t) {
     selectedTurn = t;
     fileContent = null; activeFile = null;
+    diff = null; showDiff = false;
     try {
       workspace = await api.workspaceAtTurn(id, t);
     } catch (e) {
       if (e.status === 404) workspace = { files: [], _none: true };
       else err = e;
     }
+  }
+
+  // loadDiff compares the current checkpoint tree to the previous checkpoint
+  // (turn-1, or the nearest ancestor) and classifies files as added/changed/
+  // removed/unchanged. A content-addressed manifest makes this a path+size
+  // comparison; real chunk-level diff falls out of the same digests.
+  async function loadDiff() {
+    if (!workspace || workspace._none || !selectedTurn) return;
+    try {
+      const prev = await api.workspaceAtTurn(id, selectedTurn - 1).catch(() => null);
+      if (!prev || prev._none) { diff = { none: true }; return; }
+      const cur = new Map(workspace.files.map(f => [f.path, f]));
+      const old = new Map(prev.files.map(f => [f.path, f]));
+      const added = [], changed = [], removed = [];
+      for (const [p, f] of cur) {
+        if (!old.has(p)) added.push(p);
+        else if (old.get(p).size !== f.size || !sameChunks(old.get(p), f)) changed.push(p);
+      }
+      for (const p of old.keys()) if (!cur.has(p)) removed.push(p);
+      diff = { added, changed, removed };
+    } catch (e) { diff = { error: e.message }; }
+  }
+  function sameChunks(a, b) {
+    if ((a.chunks||[]).length !== (b.chunks||[]).length) return false;
+    return (a.chunks||[]).every((c,i) => c === (b.chunks||[])[i]);
   }
 
   async function showFile(path) {
@@ -111,6 +143,17 @@
     try { await api.cancel(id); }
     catch (e) { if (e.status === 403) isReadonly = true; else actionErr = e; }
     finally { busy.cancel = false; }
+  }
+
+  async function resolveApproval(aid, decision) {
+    resolving[aid] = true; actionErr = null;
+    try {
+      await fetch(`/v1/agents/${id}/approvals/${aid}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision })
+      });
+    } catch (e) { actionErr = e; }
+    finally { resolving[aid] = false; }
   }
 
   function fmtBytes(n) { if (!n) return '–'; const u = ['B','KiB','MiB','GiB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return `${n.toFixed(i?1:0)} ${u[i]}`; }
@@ -189,10 +232,25 @@
     </div>
 
     <div class="col col-scroll card">
-      <div class="pane-title">workspace @ turn {selectedTurn ?? '–'}</div>
+      <div class="pane-title">workspace @ turn {selectedTurn ?? '–'}
+        {#if workspace && !workspace._none && selectedTurn}
+          <button class="mini" class:on={showDiff} onclick={() => { showDiff = !showDiff; if (showDiff && !diff) loadDiff(); }}>diff vs prev</button>
+        {/if}
+      </div>
       {#if !workspace}<div class="small muted">select a turn</div>
       {:else if workspace._none}<div class="small muted">no checkpoint at this turn</div>
       {:else}
+        {#if showDiff && diff}
+          <div class="diff small">
+            {#if diff.none}<span class="muted">no previous checkpoint</span>
+            {:else}
+              {#each diff.added as p}<div class="add">+ {p}</div>{/each}
+              {#each diff.changed as p}<div class="chg">~ {p}</div>{/each}
+              {#each diff.removed as p}<div class="rm">- {p}</div>{/each}
+              {#if !diff.added.length && !diff.changed.length && !diff.removed.length}<span class="muted">no changes</span>{/if}
+            {/if}
+          </div>
+        {/if}
         <ul class="files">
           {#each workspace.files as f (f.path)}
             <li>
@@ -211,11 +269,32 @@
   </div>
 
   <div class="activations card">
-    <div class="pane-title">activations</div>
+    <div class="pane-title">activations
+      {#if activeActivation}<button class="mini" onclick={() => activeActivation = null}>clear filter</button>{/if}
+    </div>
     {#each activations as a (a.id)}
-      <div class="act"><span class="code">#{a.number}</span> {time(a.started_at)} → {a.ended_at ? time(a.ended_at) : '…'} <span class="small muted">{a.end_reason||'running'}</span></div>
+      <button class="act" class:active={activeActivation===a.id} onclick={() => activeActivation = (activeActivation===a.id ? null : a.id)}>
+        <span class="code">#{a.number}</span> {time(a.started_at)} → {a.ended_at ? time(a.ended_at) : '…'} <span class="small muted">{a.end_reason||'running'}</span>
+      </button>
     {/each}
     {#if activations.length === 0}<div class="small muted">none</div>{/if}
+  </div>
+
+  <div class="approvals card">
+    <div class="pane-title">approvals</div>
+    {#if approvals.length === 0}<div class="small muted">none</div>
+    {:else}
+      {#each approvals as a (a.seq)}
+        <div class="approval">
+          <span class="code">{(a.payload?.approval_id) || ('seq'+a.seq)}</span>
+          <span class="small muted">{(a.payload?.decision) || 'pending'}</span>
+          {#if !isReadonly && !a.payload?.decision}
+            <button class="mini" onclick={() => resolveApproval(a.payload?.approval_id || '', 'approved')} disabled={resolving[a.payload?.approval_id]}>approve</button>
+            <button class="mini" onclick={() => resolveApproval(a.payload?.approval_id || '', 'denied')} disabled={resolving[a.payload?.approval_id]}>deny</button>
+          {/if}
+        </div>
+      {/each}
+    {/if}
   </div>
 
   <div class="honesty small muted">
@@ -264,4 +343,14 @@
   .honesty { margin-top: 0.5rem; }
   .red { color: var(--red); }
   .error { color: var(--red); }
+  .mini { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 3px; padding: 0 0.4rem; font-size: 0.72rem; cursor: pointer; margin-left: 0.4rem; }
+  .mini:hover { color: var(--fg); border-color: var(--fg); }
+  .mini.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .diff { margin: 0.3rem 0; padding: 0.3rem; background: var(--bg); border-radius: 4px; }
+  .diff .add { color: var(--green); }
+  .diff .chg { color: var(--amber); }
+  .diff .rm { color: var(--red); }
+  .act { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--fg); padding: 0.15rem 0.3rem; cursor: pointer; border-radius: 3px; font-size: 0.82rem; }
+  .act:hover, .act.active { background: var(--bg); }
+  .approval { padding: 0.15rem 0; font-size: 0.82rem; display: flex; gap: 0.4rem; align-items: center; }
 </style>
