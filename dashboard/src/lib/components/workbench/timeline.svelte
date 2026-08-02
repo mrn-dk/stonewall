@@ -138,10 +138,14 @@
                 </span>
 
                 {#if row.checkpoint && !row.checkpointOnly}
-                  <Diamond
-                    class="text-state-terminal size-2.5 shrink-0"
-                    aria-label="checkpoint recorded"
-                  />
+                  <!-- Labelled rather than a bare glyph: a blue diamond means
+                       nothing to someone opening the workbench for the first
+                       time, and the legend at the foot only helps if you look
+                       down there. -->
+                  <span class="text-muted-foreground flex shrink-0 items-center gap-1">
+                    <Diamond class="text-state-terminal size-2.5" />
+                    <span class="text-[0.7rem]">checkpoint</span>
+                  </span>
                 {/if}
 
                 <span class="text-muted-foreground ml-auto shrink-0 tabular-nums">
@@ -154,11 +158,4 @@
       </ol>
     {/if}
   </div>
-
-  {#if rows.some((r) => r.checkpoint)}
-    <p class="text-muted-foreground flex items-center gap-1.5 border-t px-1 pt-1.5 text-[0.7rem]">
-      <Diamond class="text-state-terminal size-2.5" />
-      checkpoint recorded at this turn
-    </p>
-  {/if}
 </div>

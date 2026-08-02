@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "contrast": "node scripts/contrast.mjs"
+    "contrast": "node scripts/contrast.mjs",
+    "test": "node --test \"src/**/*.test.js\""
   },
   "devDependencies": {
     "@internationalized/date": "^3.12.3",
