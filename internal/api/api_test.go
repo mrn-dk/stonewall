@@ -31,7 +31,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *node.Node) {
 		MaxConcurrent: 2, PollInterval: 10 * time.Millisecond,
 		ActivationTimeout: 10 * time.Second, CrashThreshold: 3, NodeBreakerThreshold: 100,
 	})
-	srv := New(":0", s, n)
+	srv := New(":0", s, n, s.Root(), nil)
 	ts := httptest.NewServer(srv.srv.Handler)
 	t.Cleanup(ts.Close)
 	// Replace addr with the test server's for telemetry only.

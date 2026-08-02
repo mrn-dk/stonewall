@@ -25,9 +25,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mrn-dk/stonewall/internal/model"
@@ -37,19 +39,45 @@ import (
 
 // Server is the control-plane HTTP server.
 type Server struct {
-	store *store.Store
-	node  *node.Node
-	addr  string
-	srv   *http.Server
+	store   *store.Store
+	node    *node.Node
+	addr    string
+	dataDir string
+	srv     *http.Server
 }
 
-// New creates a control-plane server bound to addr.
-func New(addr string, s *store.Store, n *node.Node) *Server {
-	srv := &Server{store: s, node: n, addr: addr}
+// New creates a control-plane server bound to addr. dataDir is the store's
+// root, used only for node storage-size stats (read through the API).
+// dashFS is the embedded dashboard filesystem (nil when not built into this
+// binary; the /dashboard handler then returns 503).
+func New(addr string, s *store.Store, n *node.Node, dataDir string, dashFS fs.FS) *Server {
+	srv := &Server{store: s, node: n, addr: addr, dataDir: dataDir}
 	mux := http.NewServeMux()
 	srv.register(mux)
-	srv.srv = &http.Server{Addr: addr, Handler: requestLogger(mux)}
+	handler := requestLogger(srv.routeDashboard(mux, dashFS))
+	srv.srv = &http.Server{Addr: addr, Handler: handler}
 	return srv
+}
+
+// routeDashboard wraps the API mux so API paths hit the mux and everything
+// else ("/", "/dashboard", "/_app/...", and client-side SPA routes like
+// "/agents/:id") is served by the embedded SPA with index.html fallback. This
+// avoids registering a catch-all "/" pattern that would conflict with the
+// API's method patterns.
+func (s *Server) routeDashboard(api http.Handler, dashFS fs.FS) http.Handler {
+	dash := serveDashboardHandler(dashFS)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if strings.HasPrefix(p, "/v1/") || p == "/healthz" || p == "/readyz" {
+			api.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(p, "/dashboard") {
+			http.StripPrefix("/dashboard", dash).ServeHTTP(w, r)
+			return
+		}
+		dash.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) register(mux *http.ServeMux) {
@@ -67,6 +95,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/{id}/approvals/{aid}", s.resolveApproval)
 	mux.HandleFunc("GET /v1/agents/{id}/events", s.streamEvents)
 	mux.HandleFunc("GET /v1/agents/{id}/activations", s.listActivations)
+	mux.HandleFunc("GET /v1/node/stats", s.nodeStatsHandler)
+	mux.HandleFunc("GET /v1/agents/{id}/workspace", s.browseWorkspace)
+	mux.HandleFunc("GET /v1/agents/{id}/checkpoints/{ckpt}/files", s.browseCheckpointFiles)
+	mux.HandleFunc("GET /v1/agents/{id}/checkpoints/{ckpt}/file", s.readCheckpointFile)
 }
 
 // ListenAndServe starts the control plane.
