@@ -65,6 +65,10 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.reconcileFromLogs(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: reconcile index from logs: %w", err)
+	}
 	return s, nil
 }
 
