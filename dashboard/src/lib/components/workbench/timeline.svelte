@@ -19,7 +19,16 @@
   import Square from '@lucide/svelte/icons/square';
   import WifiOff from '@lucide/svelte/icons/wifi-off';
 
-  let { entries, selectedTurn, connected, onselect } = $props();
+  let { entries, activations = [], selectedTurn, selectedKey = null, connected, onselect } = $props();
+
+  // Turn numbers restart at 1 for each activation, so "turn 3" alone does not
+  // identify a row. Rows are grouped under their run and selection is tracked
+  // by activation+turn, or three rows light up at once.
+  const runNumber = $derived.by(() => {
+    const byId = new Map();
+    for (const a of activations) byId.set(a.id, a.number);
+    return byId;
+  });
 
   // Fold the flat event list into rows: one per turn (carrying its checkpoint,
   // if any) and one per run boundary.
@@ -32,14 +41,18 @@
         const row = {
           type: 'turn',
           key: `turn-${e.seq}`,
+          id: `${e.activation_id}:${e.turn}`,
+          activationId: e.activation_id,
           turn: e.turn,
           at: e.occurred_at,
           checkpoint: null
         };
-        turnIndex.set(e.turn, row);
+        // Keyed by activation AND turn: keying on turn alone would attach run
+        // three's checkpoint to run one's turn of the same number.
+        turnIndex.set(`${e.activation_id}:${e.turn}`, row);
         out.push(row);
       } else if (e.kind === 'checkpoint') {
-        const row = turnIndex.get(e.turn);
+        const row = turnIndex.get(`${e.activation_id}:${e.turn}`);
         if (row) {
           // Folded onto its turn.
           row.checkpoint = e;
@@ -49,6 +62,8 @@
           out.push({
             type: 'turn',
             key: `ckpt-${e.seq}`,
+            id: `${e.activation_id}:${e.turn}`,
+            activationId: e.activation_id,
             turn: e.turn,
             at: e.occurred_at,
             checkpoint: e,
@@ -60,6 +75,7 @@
           type: 'boundary',
           key: `${e.kind}-${e.seq}`,
           kind: e.kind,
+          activationId: e.activation_id,
           at: e.occurred_at
         });
       }
@@ -98,6 +114,7 @@
           {#if row.type === 'boundary'}
             {@const started = row.kind === 'run_start'}
             {@const Icon = started ? Play : Square}
+            {@const num = runNumber.get(row.activationId)}
             <li class="relative py-1.5 pl-4">
               <span
                 class="bg-background text-muted-foreground absolute top-1/2 -left-[7px] flex size-3.5 -translate-y-1/2 items-center justify-center rounded-full border"
@@ -107,12 +124,12 @@
               <span
                 class="text-muted-foreground flex items-baseline gap-1.5 text-[0.7rem] tracking-wide uppercase"
               >
-                {started ? 'run started' : 'run ended'}
+                {started ? 'run' : 'end of run'}{num ? ` #${num}` : ''}
                 <span class="ml-auto tabular-nums normal-case">{timeOfDay(row.at)}</span>
               </span>
             </li>
           {:else}
-            {@const selected = selectedTurn === row.turn}
+            {@const selected = selectedKey ? selectedKey === row.id : selectedTurn === row.turn}
             <li class="relative">
               <button
                 type="button"
@@ -121,7 +138,7 @@
                   : 'hover:bg-muted'}"
                 aria-pressed={selected}
                 aria-label="Turn {row.turn}{row.checkpoint ? ', has checkpoint' : ''}"
-                onclick={() => onselect(row.turn)}
+                onclick={() => onselect(row.turn, row.id)}
               >
                 <!-- The node on the rail. Filled when selected, so the current
                      position reads at a glance down the whole column. -->

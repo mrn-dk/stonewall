@@ -54,6 +54,10 @@
   let activeActivation = $state(null);
 
   let selectedTurn = $state(null);
+  // Turn numbers restart per activation, so the selected *row* needs
+  // activation+turn to identify it even though the workspace endpoint is keyed
+  // by turn alone.
+  let selectedKey = $state(null);
   let workspace = $state(null);
   let workspaceLoading = $state(false);
   let workspaceError = $state(null);
@@ -87,6 +91,11 @@
   }
 
   let es = null;
+  // Seqs already rendered. The durable log is append-only with unique seqs, so
+  // the same seq arriving twice is always a transport artefact — a reconnect
+  // replay, say — never new information. Dropping it here keeps the keyed
+  // lists valid no matter what the stream does.
+  let seenSeqs = new Set();
   onDestroy(() => {
     es?.close();
     releaseFile();
@@ -115,8 +124,10 @@
     activationsLoading = true;
     events = [];
     connected = true;
+    seenSeqs = new Set();
     activeActivation = null;
     selectedTurn = null;
+    selectedKey = null;
     workspace = null;
     workspaceError = null;
     diff = null;
@@ -172,6 +183,8 @@
     es.onerror = () => (connected = false);
     const onEvent = (ev) => {
       const parsed = JSON.parse(ev.data);
+      if (seenSeqs.has(parsed.seq)) return;
+      seenSeqs.add(parsed.seq);
       events = [...events, parsed];
       if (parsed.kind === 'turn' && selectedTurn == null) selectTurn(parsed.turn);
       // The event log says what happened; the agent resource says what the
@@ -204,8 +217,9 @@
 
   const approvals = $derived(events.filter((e) => e.kind === 'approval'));
 
-  async function selectTurn(turn) {
+  async function selectTurn(turn, key = null) {
     selectedTurn = turn;
+    selectedKey = key;
     closeFile();
     diff = null;
     showDiff = false;
@@ -560,7 +574,9 @@
         <Resizable.Pane defaultSize={20} minSize={12} class="rounded-lg border p-2">
           <Timeline
             entries={timelineEntries}
+            {activations}
             {selectedTurn}
+            {selectedKey}
             {connected}
             onselect={selectTurn}
           />
@@ -593,7 +609,14 @@
     <!-- below the resizable breakpoint the panes stack; nothing is dropped -->
     <div class="flex flex-col gap-3 xl:hidden">
       <div class="max-h-72 rounded-lg border p-2">
-        <Timeline entries={timelineEntries} {selectedTurn} {connected} onselect={selectTurn} />
+        <Timeline
+          entries={timelineEntries}
+          {activations}
+          {selectedTurn}
+          {selectedKey}
+          {connected}
+          onselect={selectTurn}
+        />
       </div>
       <div class="max-h-[32rem] rounded-lg border p-2">
         <Transcript events={transcriptEvents} {selectedTurn} />

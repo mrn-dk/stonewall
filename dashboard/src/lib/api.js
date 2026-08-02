@@ -72,8 +72,11 @@ export const api = {
   // Workspace + stats
   nodeStats: () => req('/v1/node/stats'),
   workspaceAtTurn: (id, turn) => req(`/v1/agents/${id}/workspace${turn ? `?at_turn=${turn}` : ''}`),
-  // Events stream (SSE) — returns an EventSource with Last-Event-ID resume.
-  events: (id, lastSeq = 0) => new EventSource(`/v1/agents/${id}/events?after=${lastSeq}`)
+  // Events stream (SSE). `after` is only sent when starting partway through:
+  // on reconnect the browser sends Last-Event-ID by itself, and pinning
+  // `after=0` on every connection would fight it and replay the whole log.
+  events: (id, lastSeq = 0) =>
+    new EventSource(`/v1/agents/${id}/events${lastSeq ? `?after=${lastSeq}` : ''}`)
 };
 
 /**

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -222,6 +223,85 @@ func TestAPIListAgentsTextQuery(t *testing.T) {
 	}
 }
 
+// The stream must deliver each event exactly once. Regression: the backlog
+// replay did not advance the tail cursor, so the first tail tick re-sent the
+// whole backlog and every event arrived twice — which also broke any client
+// keying a list on seq.
+func TestAPIEventStreamHasNoDuplicates(t *testing.T) {
+	srv, s, n := newTestServer(t)
+	base := srv.addr
+
+	resp := postJSON(t, base, "/v1/agents", `{"image":"acme/x:1","goal":"g","checkpoint":"per_turn"}`)
+	var ag model.Agent
+	json.NewDecoder(resp.Body).Decode(&ag)
+	resp.Body.Close()
+
+	resp = postJSON(t, base, "/v1/agents/"+ag.ID+"/messages", `{"body":"go"}`)
+	resp.Body.Close()
+	runUntilSettled(t, s, n, ag.ID)
+
+	stream := get(t, base, "/v1/agents/"+ag.ID+"/events?after=0")
+	defer stream.Body.Close()
+	seqs := readSSESeqs(t, stream.Body)
+
+	if len(seqs) == 0 {
+		t.Fatal("stream produced no events")
+	}
+	seen := map[uint64]int{}
+	for _, seq := range seqs {
+		seen[seq]++
+	}
+	for seq, count := range seen {
+		if count > 1 {
+			t.Fatalf("seq %d delivered %d times; the stream must not duplicate events", seq, count)
+		}
+	}
+	// And the log itself is the same set, so nothing was dropped either.
+	logged, err := s.ReadEvents(ag.ID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != len(logged) {
+		t.Fatalf("stream delivered %d distinct events, log holds %d", len(seen), len(logged))
+	}
+}
+
+// Last-Event-ID is the reconnect signal and must win over the ?after the
+// client used on its original connection; otherwise every reconnect replays
+// from that original point instead of resuming.
+func TestAPIEventStreamResumesFromLastEventID(t *testing.T) {
+	srv, s, n := newTestServer(t)
+	base := srv.addr
+
+	resp := postJSON(t, base, "/v1/agents", `{"image":"acme/x:1","goal":"g"}`)
+	var ag model.Agent
+	json.NewDecoder(resp.Body).Decode(&ag)
+	resp.Body.Close()
+	resp = postJSON(t, base, "/v1/agents/"+ag.ID+"/messages", `{"body":"go"}`)
+	resp.Body.Close()
+	runUntilSettled(t, s, n, ag.ID)
+
+	// Reconnect the way a browser does: same ?after=0 as the first connection,
+	// plus the header naming the last event actually seen.
+	req, _ := http.NewRequest("GET", base+"/v1/agents/"+ag.ID+"/events?after=0", nil)
+	req.Header.Set("Last-Event-ID", "3")
+	stream, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Body.Close()
+
+	seqs := readSSESeqs(t, stream.Body)
+	if len(seqs) == 0 {
+		t.Fatal("stream produced no events")
+	}
+	for _, seq := range seqs {
+		if seq <= 3 {
+			t.Fatalf("resumed at seq %d; Last-Event-ID: 3 must win over ?after=0", seq)
+		}
+	}
+}
+
 // helpers
 
 func postJSON(t *testing.T, base, path, body string) *http.Response {
@@ -270,4 +350,47 @@ func readSSE(t *testing.T, r io.Reader) string {
 		}
 	}
 	return buf.String()
+}
+
+// readSSESeqs collects the `id:` values from an SSE stream until it ends or
+// goes quiet. Reading ids rather than the raw text is what makes duplicate
+// delivery visible.
+func readSSESeqs(t *testing.T, r io.Reader) []uint64 {
+	t.Helper()
+	br := bufio.NewReader(r)
+	var out []uint64
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err := br.ReadString('\n')
+		if strings.HasPrefix(line, "id: ") {
+			if n, perr := strconv.ParseUint(strings.TrimSpace(line[4:]), 10, 64); perr == nil {
+				out = append(out, n)
+			}
+		}
+		if strings.HasPrefix(line, "event: done") {
+			break
+		}
+		if err != nil {
+			break
+		}
+	}
+	return out
+}
+
+// runUntilSettled drives the scheduler until the agent has finished its
+// activation, so a stream test reads a complete log rather than racing one
+// still being written.
+func runUntilSettled(t *testing.T, s *store.Store, n *node.Node, id string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a, err := s.GetAgent(id); err == nil && (a.State == model.StateParked || a.State.Terminal()) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("agent %s did not settle", id)
 }
