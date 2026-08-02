@@ -158,6 +158,70 @@ func TestAPIValidation(t *testing.T) {
 	}
 }
 
+// The `q` parameter narrows the list over the wire, composes with `state` and
+// `limit`, and is absent-tolerant: no `q` behaves exactly as before.
+func TestAPIListAgentsTextQuery(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	base := srv.addr
+
+	for _, body := range []string{
+		`{"image":"acme/agent-host:1.4","goal":"build the search index"}`,
+		`{"image":"acme/agent-host:1.4","goal":"summarise the repo"}`,
+		`{"image":"other/indexer:2.0","goal":"unrelated work"}`,
+	} {
+		if resp := postJSON(t, base, "/v1/agents", body); resp.StatusCode != 201 {
+			t.Fatalf("create: want 201, got %d", resp.StatusCode)
+		} else {
+			resp.Body.Close()
+		}
+	}
+
+	listed := func(path string) []map[string]any {
+		t.Helper()
+		resp := get(t, base, path)
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s: want 200, got %d", path, resp.StatusCode)
+		}
+		var out struct {
+			Agents []map[string]any `json:"agents"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("%s: decode: %v", path, err)
+		}
+		return out.Agents
+	}
+
+	if got := listed("/v1/agents"); len(got) != 3 {
+		t.Fatalf("no query: want 3 agents, got %d", len(got))
+	}
+	// Matches goal and image, case-insensitively.
+	if got := listed("/v1/agents?q=INDEX"); len(got) != 2 {
+		t.Fatalf("q=INDEX: want 2 agents, got %d", len(got))
+	}
+	if got := listed("/v1/agents?q=summarise"); len(got) != 1 {
+		t.Fatalf("q=summarise: want 1 agent, got %d", len(got))
+	}
+	// Composes with limit; the cursor continues the filtered sequence.
+	page := listed("/v1/agents?q=index&limit=1")
+	if len(page) != 1 {
+		t.Fatalf("q=index&limit=1: want 1 agent, got %d", len(page))
+	}
+	rest := listed("/v1/agents?q=index&limit=5&after=" + page[0]["id"].(string))
+	if len(rest) != 1 {
+		t.Fatalf("second page: want 1 agent, got %d", len(rest))
+	}
+	// A query matching nothing is an empty success, not an error.
+	resp := get(t, base, "/v1/agents?q=nothing-matches-this")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("no match: want 200, got %d", resp.StatusCode)
+	}
+	if got := listed("/v1/agents?q=nothing-matches-this"); len(got) != 0 {
+		t.Fatalf("no match: want 0 agents, got %d", len(got))
+	}
+}
+
 // helpers
 
 func postJSON(t *testing.T, base, path, body string) *http.Response {
