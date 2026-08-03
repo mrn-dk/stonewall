@@ -79,12 +79,10 @@ func (c *checkpointingSink) snapshot(turn int, boundarySeq uint64) error {
 	if err != nil {
 		return err
 	}
-	// The checkpoint event is appended after the boundary it belongs to, so its
-	// own ordinal is the next turn's. The payload carries the boundary it
-	// describes.
+	// The event's own ordinal names the boundary it snapshots, so the payload
+	// carries only what the ordinal does not: the boundary's address in the log.
 	if _, err := c.store.AppendEvent(c.agentID, c.activationID, model.EventCheckpoint, 0, "", map[string]any{
 		"checkpoint_id": cp.ID,
-		"turn":          turn,
 		"boundary_seq":  boundarySeq,
 		"parent":        cp.ParentID,
 	}); err != nil {

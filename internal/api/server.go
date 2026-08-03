@@ -369,7 +369,7 @@ func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.store.AppendEvent(id, "", model.EventCheckpoint, 0, "", map[string]any{
-		"checkpoint_id": cp.ID, "turn": at.Turn, "boundary_seq": at.Seq,
+		"checkpoint_id": cp.ID, "boundary_seq": at.Seq,
 		"parent": cp.ParentID, "explicit": true,
 	}); err != nil {
 		internalErr(w, err.Error())

@@ -278,10 +278,12 @@ func TestResumeRestoresFromTheCheckpointOfItsActualLastTurn(t *testing.T) {
 	}
 }
 
-// TestCheckpointEventNamesItsBoundary: the checkpoint event is appended after
-// the boundary it belongs to, so it carries the boundary's turn and seq in its
-// payload — which is what the dashboard's timeline labels a checkpoint with.
-func TestCheckpointEventNamesItsBoundary(t *testing.T) {
+// TestEventsDescribingATurnCarryItsOrdinal: an event's turn field means "the
+// turn this event belongs to". A checkpoint describes the boundary it snapshots
+// rather than the turn that follows it, so it carries that boundary's ordinal —
+// there is one authoritative value for the concept, not one on the event and a
+// different one in the payload.
+func TestEventsDescribingATurnCarryItsOrdinal(t *testing.T) {
 	n, s := newTestNode(t)
 	t.Setenv("MOCK_TURNS", "2")
 	runTwoActivations(t, n, s, "a1", model.CheckpointPerTurn)
@@ -290,30 +292,73 @@ func TestCheckpointEventNamesItsBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var turns []int
+	// Pair each checkpoint with the turn boundary it snapshots: the boundary its
+	// payload addresses by sequence.
+	boundaryTurn := map[uint64]int{}
+	for _, e := range evs {
+		if e.Kind == model.EventTurnBoundary {
+			boundaryTurn[e.Seq] = e.Turn
+		}
+	}
+	var got []int
 	for _, e := range evs {
 		if e.Kind != model.EventCheckpoint {
 			continue
 		}
 		var p struct {
-			Turn        int    `json:"turn"`
 			BoundarySeq uint64 `json:"boundary_seq"`
 		}
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			t.Fatal(err)
 		}
-		if p.BoundarySeq == 0 || p.BoundarySeq >= e.Seq {
-			t.Fatalf("checkpoint at seq %d names boundary seq %d", e.Seq, p.BoundarySeq)
+		want, ok := boundaryTurn[p.BoundarySeq]
+		if !ok {
+			t.Fatalf("checkpoint at seq %d names boundary seq %d, which is not a turn boundary", e.Seq, p.BoundarySeq)
 		}
-		turns = append(turns, p.Turn)
+		if e.Turn != want {
+			t.Fatalf("checkpoint at seq %d snapshots the boundary at turn %d but carries ordinal %d",
+				e.Seq, want, e.Turn)
+		}
+		got = append(got, e.Turn)
 	}
 	want := []int{1, 2, 3, 4}
-	if len(turns) != len(want) {
-		t.Fatalf("checkpoint turns = %v, want %v", turns, want)
+	if len(got) != len(want) {
+		t.Fatalf("checkpoint ordinals = %v, want %v", got, want)
 	}
 	for i := range want {
-		if turns[i] != want[i] {
-			t.Fatalf("checkpoint turns = %v, want %v", turns, want)
+		if got[i] != want[i] {
+			t.Fatalf("checkpoint ordinals = %v, want %v", got, want)
 		}
+	}
+}
+
+// TestRunEndCarriesTheLastCompletedTurn: a run_end must not claim a turn that
+// never happened. It ends a run after the last turn that closed, so that is the
+// turn it belongs to.
+func TestRunEndCarriesTheLastCompletedTurn(t *testing.T) {
+	n, s := newTestNode(t)
+	t.Setenv("MOCK_TURNS", "2")
+	runTwoActivations(t, n, s, "a1", model.CheckpointPerTurn)
+
+	evs, err := s.ReadEvents("a1", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := 0
+	var ends []int
+	for _, e := range evs {
+		switch e.Kind {
+		case model.EventTurnBoundary:
+			completed = e.Turn
+		case model.EventRunEnd:
+			if e.Turn != completed {
+				t.Fatalf("run_end at seq %d carries turn %d, but the last turn to complete was %d",
+					e.Seq, e.Turn, completed)
+			}
+			ends = append(ends, e.Turn)
+		}
+	}
+	if len(ends) != 2 || ends[0] != 2 || ends[1] != 4 {
+		t.Fatalf("run_end turns = %v, want [2 4]", ends)
 	}
 }

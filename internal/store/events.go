@@ -139,8 +139,8 @@ func (l *eventLog) close() {
 // runtimeTurn is whatever the writer counted for itself. It is NOT the event's
 // turn: a runtime's counter is a per-activation budget and resets at every wake,
 // so it is retained in the payload as run-relative information (`runtime_turn`)
-// and nothing else. The authoritative ordinal is counted by the store: events
-// carry completed_turns+1, and a turn-boundary event closes that turn.
+// and nothing else. The authoritative ordinal is counted by the store, and it
+// always names the turn the event belongs to (see turnOrdinalFor).
 func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, runtimeTurn int, idem string, payload any) (*model.Event, error) {
 	l, err := s.openLog(agentID)
 	if err != nil {
@@ -166,7 +166,7 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 		ActivationID:   activationID,
 		Kind:           kind,
 		OccurredAt:     now(),
-		Turn:           l.completed + 1,
+		Turn:           turnOrdinalFor(kind, l.completed),
 		Durability:     model.DurabilityFleet, // single node: local fsync == fleet ack
 		IdempotencyKey: idem,
 		Payload:        raw,
@@ -204,6 +204,26 @@ func (s *Store) AppendEvent(agentID, activationID string, kind model.EventKind, 
 		_ = err
 	}
 	return e, nil
+}
+
+// turnOrdinalFor assigns the ordinal of the turn an event belongs to, given how
+// many turns the agent has completed.
+//
+// Most events occur *within* a turn that is in progress, so they carry the next
+// ordinal: completed+1. Some events instead *describe* a turn that has already
+// closed — a checkpoint of the workspace as it stood at a boundary, and the end
+// of a run — and those carry that turn's own ordinal. Anything else would leave
+// the authoritative value somewhere other than the field that names it, which is
+// the split that made turn numbers ambiguous in the first place.
+//
+// An event describing a turn on an agent that has completed none carries 0: no
+// turn, stated plainly, rather than a turn that never happened.
+func turnOrdinalFor(kind model.EventKind, completed int) int {
+	switch kind {
+	case model.EventCheckpoint, model.EventRunEnd:
+		return completed
+	}
+	return completed + 1
 }
 
 // withRuntimeTurn records the writer's own turn number alongside its payload.
