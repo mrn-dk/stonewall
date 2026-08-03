@@ -356,13 +356,21 @@ func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ws := s.store.WorkspacePath(id)
-	cp, err := s.store.SnapshotWorkspace(id, a.LastTurn, ws, a.LastCheckpointID)
+	// An explicit checkpoint holds the workspace as it stands at the agent's
+	// last turn boundary, so it is addressed by that boundary's sequence.
+	at, err := s.store.LastTurnBoundary(id)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		internalErr(w, err.Error())
+		return
+	}
+	cp, err := s.store.SnapshotWorkspace(id, at.Turn, at.Seq, ws, a.LastCheckpointID)
 	if err != nil {
 		internalErr(w, err.Error())
 		return
 	}
-	if _, err := s.store.AppendEvent(id, "", model.EventCheckpoint, a.LastTurn, "", map[string]any{
-		"checkpoint_id": cp.ID, "turn": a.LastTurn, "parent": cp.ParentID, "explicit": true,
+	if _, err := s.store.AppendEvent(id, "", model.EventCheckpoint, 0, "", map[string]any{
+		"checkpoint_id": cp.ID, "boundary_seq": at.Seq,
+		"parent": cp.ParentID, "explicit": true,
 	}); err != nil {
 		internalErr(w, err.Error())
 		return
@@ -371,8 +379,12 @@ func (s *Server) checkpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, cp)
 }
 
+// forkRequest addresses the point to fork at, either by turn ordinal (the Nth
+// turn boundary of the parent's log, counted across all of its activations) or
+// by the sequence number of that boundary. The two are the same address.
 type forkRequest struct {
-	AtTurn int `json:"at_turn"`
+	AtTurn int    `json:"at_turn"`
+	Seq    uint64 `json:"seq"`
 }
 
 func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
@@ -382,14 +394,30 @@ func (s *Server) fork(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid JSON: "+err.Error())
 		return
 	}
-	if req.AtTurn < 0 {
-		badRequest(w, "at_turn must be >= 0")
+	if (req.AtTurn > 0) == (req.Seq > 0) {
+		badRequest(w, "exactly one of at_turn (>= 1) or seq is required")
 		return
 	}
-	child, err := s.node.Fork(id, req.AtTurn)
-	if err != nil {
+	if _, err := s.store.GetAgent(id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			notFound(w, "parent agent not found")
+			return
+		}
+		internalErr(w, err.Error())
+		return
+	}
+	var child *model.Agent
+	var err error
+	if req.Seq > 0 {
+		child, err = s.node.ForkAtSeq(id, req.Seq)
+	} else {
+		child, err = s.node.Fork(id, req.AtTurn)
+	}
+	if err != nil {
+		// The parent exists, so a not-found here means the address does: a turn
+		// the agent has not reached, or a sequence that is not a turn boundary.
+		if errors.Is(err, store.ErrNotFound) {
+			notFound(w, err.Error())
 			return
 		}
 		internalErr(w, err.Error())

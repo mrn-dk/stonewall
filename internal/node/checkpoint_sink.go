@@ -27,9 +27,12 @@ type checkpointingSink struct {
 	lastSnapshotTurn int
 }
 
-// Append implements runtime.EventSink with checkpointing.
-func (c *checkpointingSink) Append(agentID, activationID string, kind model.EventKind, turn int, idem string, payload any) (uint64, error) {
-	ev, err := c.store.AppendEvent(agentID, activationID, kind, turn, idem, payload)
+// Append implements runtime.EventSink with checkpointing. The runtime's own
+// turn number is passed through to the store as run-relative information; the
+// turn a checkpoint is recorded at is the store-assigned ordinal on the
+// appended event, which spans the agent's activations.
+func (c *checkpointingSink) Append(agentID, activationID string, kind model.EventKind, runtimeTurn int, idem string, payload any) (uint64, error) {
+	ev, err := c.store.AppendEvent(agentID, activationID, kind, runtimeTurn, idem, payload)
 	if err != nil {
 		return 0, err
 	}
@@ -37,8 +40,8 @@ func (c *checkpointingSink) Append(agentID, activationID string, kind model.Even
 	case model.EventWorkspaceMod:
 		c.modifiedThisTurn = true
 	case model.EventTurnBoundary:
-		if c.shouldSnapshot(turn) {
-			if err := c.snapshot(turn); err != nil {
+		if c.shouldSnapshot(ev.Turn) {
+			if err := c.snapshot(ev.Turn, ev.Seq); err != nil {
 				// A checkpoint failure must not abort the activation; the event
 				// is already durable. The workspace volume still holds the
 				// state for instance-durable recovery.
@@ -69,15 +72,18 @@ func (c *checkpointingSink) shouldSnapshot(turn int) bool {
 }
 
 // snapshot creates an incremental checkpoint, records it in the log, and chains
-// it to the previous one.
-func (c *checkpointingSink) snapshot(turn int) error {
-	cp, err := c.store.SnapshotWorkspace(c.agentID, turn, c.workspaceDir, c.parent)
+// it to the previous one. boundarySeq addresses the turn boundary the workspace
+// stood at, which is how the checkpoint is resolved later.
+func (c *checkpointingSink) snapshot(turn int, boundarySeq uint64) error {
+	cp, err := c.store.SnapshotWorkspace(c.agentID, turn, boundarySeq, c.workspaceDir, c.parent)
 	if err != nil {
 		return err
 	}
-	if _, err := c.store.AppendEvent(c.agentID, c.activationID, model.EventCheckpoint, turn, "", map[string]any{
+	// The event's own ordinal names the boundary it snapshots, so the payload
+	// carries only what the ordinal does not: the boundary's address in the log.
+	if _, err := c.store.AppendEvent(c.agentID, c.activationID, model.EventCheckpoint, 0, "", map[string]any{
 		"checkpoint_id": cp.ID,
-		"turn":          turn,
+		"boundary_seq":  boundarySeq,
 		"parent":        cp.ParentID,
 	}); err != nil {
 		return err

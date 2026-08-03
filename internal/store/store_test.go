@@ -157,13 +157,13 @@ func TestCheckpointIncrementalContentAddressed(t *testing.T) {
 	ws, _ := s.EnsureWorkspace("a1")
 	// Write a file.
 	os.WriteFile(filepath.Join(ws, "a.txt"), []byte(strings.Repeat("A", 200_000)), 0o644)
-	cp1, err := s.SnapshotWorkspace("a1", 1, ws, "")
+	cp1, err := s.SnapshotWorkspace("a1", 1, 1, ws, "")
 	if err != nil {
 		t.Fatalf("snapshot1: %v", err)
 	}
 	// Modify only one file; add another. Unchanged file chunks are shared.
 	os.WriteFile(filepath.Join(ws, "b.txt"), []byte("new"), 0o644)
-	cp2, err := s.SnapshotWorkspace("a1", 2, ws, cp1.ID)
+	cp2, err := s.SnapshotWorkspace("a1", 2, 2, ws, cp1.ID)
 	if err != nil {
 		t.Fatalf("snapshot2: %v", err)
 	}

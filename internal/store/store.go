@@ -65,6 +65,10 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.reconcileFromLogs(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: reconcile index from logs: %w", err)
+	}
 	return s, nil
 }
 
@@ -87,7 +91,36 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	// Additive column for stores created before checkpoints were addressed by
+	// the turn boundary that produced them. Existing rows keep 0 until the
+	// startup reconciliation backfills them from the log.
+	if err := s.addColumn("checkpoints", "boundary_seq", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("store: migrate checkpoints.boundary_seq: %w", err)
+	}
 	return nil
+}
+
+// addColumn adds a column if the table does not already have it.
+func (s *Store) addColumn(table, column, decl string) error {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl)
+	return err
 }
 
 const schema = `
@@ -129,16 +162,24 @@ CREATE TABLE IF NOT EXISTS activations (
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
-    id         TEXT PRIMARY KEY,
-    agent_id   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    turn       INTEGER NOT NULL,
-    parent_id  TEXT NOT NULL DEFAULT '',
-    manifest   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    id           TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    turn         INTEGER NOT NULL,
+    -- boundary_seq is the sequence of the turn boundary this checkpoint was
+    -- produced at: the point in the log the workspace it holds stood at. It is
+    -- what makes "the workspace as of turn N" a range query with one answer.
+    -- 0 means "not known", for rows written before the column existed and not
+    -- yet backfilled from the log.
+    boundary_seq INTEGER NOT NULL DEFAULT 0,
+    parent_id    TEXT NOT NULL DEFAULT '',
+    manifest     TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_activations_agent ON activations(agent_id, number);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_agent ON checkpoints(agent_id, turn);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_boundary ON checkpoints(agent_id, boundary_seq);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_created ON checkpoints(agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_agents_state ON agents(state);
 
 CREATE TABLE IF NOT EXISTS agent_inputs (
