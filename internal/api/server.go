@@ -3,7 +3,9 @@
 // Endpoints (all under /v1):
 //
 //	POST   /v1/agents                      create an agent
-//	GET    /v1/agents                      list agents (cursor paging, state filter)
+//	GET    /v1/agents                      list agents (cursor paging; `state`
+//	                                       filter and `q` text query over goal
+//	                                       and image, matched server-side)
 //	GET    /v1/agents/{id}                 get an agent
 //	DELETE /v1/agents/{id}                 destroy an agent
 //	POST   /v1/agents/{id}/messages       send a message (wake / in-run steer)
@@ -237,6 +239,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.ListAgentsFilter{
 		State:   model.AgentState(q.Get("state")),
+		Query:   q.Get("q"),
 		AfterID: q.Get("after"),
 		Limit:   int(parseUint(q.Get("limit"), 100)),
 	}

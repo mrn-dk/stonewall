@@ -257,3 +257,113 @@ func TestForkPointerAndHistoryWalk(t *testing.T) {
 		t.Fatalf("history turns = %v want %v", turns, want)
 	}
 }
+
+// mustCreateWith creates an agent with a specific goal and image so the text
+// query has something meaningful to match.
+func mustCreateWith(t *testing.T, s *Store, id, goal, image string) *model.Agent {
+	t.Helper()
+	a := &model.Agent{
+		ID:         id,
+		Image:      image,
+		Goal:       goal,
+		Model:      "gpt-test",
+		Grants:     model.Grants{FS: map[string]string{"/workspace": "rw"}},
+		Isolation:  model.IsolationDedicated,
+		Checkpoint: model.CheckpointOnWrite,
+		State:      model.StatePending,
+	}
+	if err := s.CreateAgent(a); err != nil {
+		t.Fatalf("create %s: %v", id, err)
+	}
+	return a
+}
+
+func ids(agents []*model.Agent) []string {
+	out := make([]string, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, a.ID)
+	}
+	return out
+}
+
+// The text query narrows the list server-side, matches goal and image
+// case-insensitively, and treats LIKE metacharacters as literals.
+func TestListAgentsTextQuery(t *testing.T) {
+	s := tmpStore(t)
+	mustCreateWith(t, s, "agt-1", "build the search index", "acme/agent-host:1.4")
+	mustCreateWith(t, s, "agt-2", "summarise the repo", "acme/agent-host:1.4")
+	mustCreateWith(t, s, "agt-3", "unrelated work", "other/INDEXER:2.0")
+	mustCreateWith(t, s, "agt-4", "100% coverage", "acme/agent-host:1.4")
+
+	cases := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"matches goal", "search", []string{"agt-1"}},
+		{"matches image", "other/", []string{"agt-3"}},
+		{"case-insensitive on both sides", "INDEX", []string{"agt-1", "agt-3"}},
+		{"empty query does not filter", "", []string{"agt-1", "agt-2", "agt-3", "agt-4"}},
+		{"whitespace-only query does not filter", "   ", []string{"agt-1", "agt-2", "agt-3", "agt-4"}},
+		{"percent is a literal, not a wildcard", "100%", []string{"agt-4"}},
+		{"underscore is a literal, not a wildcard", "100_", nil},
+		{"no match returns nothing", "nothing-matches-this", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.ListAgents(ListAgentsFilter{Query: tc.query, Limit: 10})
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("query %q: want %v, got %v", tc.query, tc.want, ids(got))
+			}
+			for i, id := range tc.want {
+				if got[i].ID != id {
+					t.Fatalf("query %q: want %v, got %v", tc.query, tc.want, ids(got))
+				}
+			}
+		})
+	}
+}
+
+// The query composes with the state filter and with cursor paging: paging
+// through a filtered list continues the same filtered sequence.
+func TestListAgentsQueryComposesWithStateAndPaging(t *testing.T) {
+	s := tmpStore(t)
+	mustCreateWith(t, s, "agt-1", "index the corpus", "acme/agent-host:1.4")
+	mustCreateWith(t, s, "agt-2", "index the docs", "acme/agent-host:1.4")
+	mustCreateWith(t, s, "agt-3", "index the code", "acme/agent-host:1.4")
+	mustCreateWith(t, s, "agt-4", "summarise the repo", "acme/agent-host:1.4")
+
+	// agt-2 is the only running agent matching "index".
+	if err := s.UpdateState("agt-2", model.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateState("agt-4", model.StateRunning); err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.ListAgents(ListAgentsFilter{State: model.StateRunning, Query: "index", Limit: 10})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(running) != 1 || running[0].ID != "agt-2" {
+		t.Fatalf("state+query: want [agt-2], got %v", ids(running))
+	}
+
+	// Paging: two pages of one, staying within the filtered sequence.
+	first, err := s.ListAgents(ListAgentsFilter{Query: "index", Limit: 2})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(first) != 2 || first[0].ID != "agt-1" || first[1].ID != "agt-2" {
+		t.Fatalf("first page: want [agt-1 agt-2], got %v", ids(first))
+	}
+	next, err := s.ListAgents(ListAgentsFilter{Query: "index", AfterID: first[1].ID, Limit: 2})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(next) != 1 || next[0].ID != "agt-3" {
+		t.Fatalf("second page: want [agt-3], got %v", ids(next))
+	}
+}

@@ -60,6 +60,32 @@ curl :8080/v1/agents/<id>/fork     -d '{"at_turn": 12}'
 curl :8080/v1/agents/<id>/restore  -d '{"checkpoint_id": "<ckpt>"}'
 ```
 
+## Dashboard
+
+`make build` compiles the operator dashboard into the same binary, so opening
+`http://localhost:8080/` serves it — no separate static host, and no request
+leaves the origin, so it works on an isolated network.
+
+It is an ordinary client of the API above, with no privileged path. The landing
+page is a light fleet overview (counts, node resources, a cursor-paged table
+with server-side state and text filtering). The depth is in the **workbench** at
+`/agents/<id>`: a timeline, the conversation transcript, and the workspace as it
+existed at a chosen turn, all keyed by turn — plus send-input, cancel, fork,
+restore, checkpoint, and delete. Press `⌘K` / `Ctrl-K` for the command palette.
+
+`go build ./...` without the `dashboard` tag omits the UI; the `/dashboard`
+handler then returns 503 and the API is unaffected.
+
+Working on the dashboard itself:
+
+```
+cd dashboard
+npm install
+npm run dev        # vite dev server, proxying /v1 to localhost:8080
+npm run check      # svelte-check
+npm run contrast   # WCAG AA audit of the design tokens
+```
+
 ## Components
 
 | Project | Role |

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mrn-dk/stonewall/internal/model"
@@ -153,9 +154,20 @@ func (s *Store) GetAgent(id string) (*model.Agent, error) {
 // ListAgentsFilter filters the agent list.
 type ListAgentsFilter struct {
 	State model.AgentState
+	// Query is a case-insensitive substring matched against goal and image.
+	// Empty means no text filter. Filtering happens here rather than in the
+	// caller so a client can search the fleet without loading it.
+	Query string
 	// AfterID is the cursor for paging (exclusive). Empty means from the start.
 	AfterID string
 	Limit   int
+}
+
+// likeEscape escapes the LIKE wildcards so a query containing % or _ matches
+// those characters literally rather than acting as a pattern.
+func likeEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // ListAgents returns agents ordered by created_at, id for stable paging.
@@ -169,6 +181,15 @@ func (s *Store) ListAgents(f ListAgentsFilter) ([]*model.Agent, error) {
 	if f.State != "" {
 		where = append(where, `state = ?`)
 		args = append(args, string(f.State))
+	}
+	if q := strings.TrimSpace(f.Query); q != "" {
+		// Substring match, not FTS: on a single node this scans a table that
+		// comfortably holds the fleet sizes this store targets. What matters is
+		// that the predicate lives here, so a fleet backend can swap it for an
+		// index or an FTS5 table without any caller noticing.
+		pattern := "%" + likeEscape(strings.ToLower(q)) + "%"
+		where = append(where, `(LOWER(goal) LIKE ? ESCAPE '\' OR LOWER(image) LIKE ? ESCAPE '\')`)
+		args = append(args, pattern, pattern)
 	}
 	if f.AfterID != "" {
 		// Cursor by (created_at,id): use a subquery to fetch the cursor row's key.

@@ -1,124 +1,202 @@
 <script>
+  // Fleet overview — the door you walk through to reach a workbench.
+  //
+  // Deliberately light: counts, node resources, a filterable cursor-paged
+  // table. Depth belongs in the workbench. The filter and query live in the
+  // URL and are applied by the API, so this page never loads the whole fleet
+  // in order to search it.
   import { api } from '$lib/api.js';
-  import { onMount } from 'svelte';
-  import { goto } from '$app/navigation';
+  import { page } from '$app/state';
+  import { startPolling } from '$lib/live.svelte.js';
+  import { toasts } from '$lib/toasts.svelte.js';
+  import NodeStatsStrip from '$lib/components/node-stats-strip.svelte';
+  import AgentTable from '$lib/components/agent-table.svelte';
+  import FleetFilters from '$lib/components/fleet-filters.svelte';
+  import CreateAgentDialog from '$lib/components/create-agent-dialog.svelte';
+  import LoadingState from '$lib/components/states/loading-state.svelte';
+  import EmptyState from '$lib/components/states/empty-state.svelte';
+  import ErrorState from '$lib/components/states/error-state.svelte';
+  import { Button } from '$lib/components/ui/button/index.js';
+  import Bot from '@lucide/svelte/icons/bot';
+  import SearchX from '@lucide/svelte/icons/search-x';
+
+  const PAGE_SIZE = 100;
 
   let agents = $state([]);
-  let stats = $state(null);
-  let loading = $state(true);
-  let err = $state(null);
   let next = $state('');
+  let loading = $state(true);
+  let loadingMore = $state(false);
+  let err = $state(null);
 
-  let counts = $derived(
-    agents.reduce((c, a) => {
-      c[a.state] = (c[a.state] || 0) + 1;
-      c.total = (c.total || 0) + 1;
-      return c;
-    }, {})
+  let stats = $state(null);
+  let statsError = $state(null);
+
+  let createOpen = $state(false);
+
+  // The URL is the single source of truth for what is being listed.
+  const activeState = $derived(page.url.searchParams.get('state') ?? '');
+  const query = $derived(page.url.searchParams.get('q') ?? '');
+  const filtered = $derived(Boolean(activeState || query));
+
+  // Counts describe the rows actually loaded, and the label says so ("loaded")
+  // rather than implying a fleet-wide total the API never returned.
+  const counts = $derived(
+    agents.reduce(
+      (c, a) => {
+        c[a.state] = (c[a.state] || 0) + 1;
+        c.total += 1;
+        return c;
+      },
+      { total: 0 }
+    )
   );
 
-  onMount(load);
+  // A stamp per request: a slow earlier response must never overwrite a newer
+  // one when the operator keeps typing.
+  let seq = 0;
+  // Rows the operator has pulled in with "load more". A background refresh has
+  // to fetch at least this many or it would silently throw those pages away.
+  let loadedCount = $state(PAGE_SIZE);
 
+  $effect(() => {
+    void activeState;
+    void query;
+    loadedCount = PAGE_SIZE;
+    load();
+  });
+
+  $effect(() => {
+    loadStats();
+    // Refresh often enough that the fleet feels live, rarely enough that an
+    // idle dashboard is not a load source. Polling because the API has no
+    // fleet-wide event stream — per-agent SSE only.
+    return startPolling(refresh, 4000);
+  });
+
+  /** Foreground load: may show a loading state and may surface an error. */
   async function load() {
+    const mine = ++seq;
     loading = true;
+    err = null;
     try {
-      const [list, node] = await Promise.all([api.listAgents(''), api.nodeStats().catch(() => null)]);
-      agents = list.agents || [];
-      next = list.next_cursor || '';
-      stats = node;
+      const res = await api.listAgents({ state: activeState, q: query, limit: PAGE_SIZE });
+      if (mine !== seq) return;
+      agents = res.agents || [];
+      next = res.next_cursor || '';
     } catch (e) {
+      if (mine !== seq) return;
       err = e;
     } finally {
-      loading = false;
+      if (mine === seq) loading = false;
+    }
+  }
+
+  /**
+   * Background refresh. Deliberately unlike `load`: it never sets `loading`,
+   * so a populated table does not flash; it re-requests everything the
+   * operator has paged in; and on failure it leaves the last good data alone.
+   * A blip in a poll is not a reason to replace a working view with an error.
+   */
+  async function refresh() {
+    const mine = ++seq;
+    try {
+      const [list, node] = await Promise.all([
+        api.listAgents({ state: activeState, q: query, limit: loadedCount }),
+        api.nodeStats().catch(() => null)
+      ]);
+      if (mine !== seq) return;
+      agents = list.agents || [];
+      next = list.next_cursor || '';
+      err = null;
+      if (node) {
+        stats = node;
+        statsError = null;
+      }
+    } catch {
+      // Intentionally silent: keep showing what we have.
+    }
+  }
+
+  async function loadStats() {
+    try {
+      stats = await api.nodeStats();
+      statsError = null;
+    } catch (e) {
+      stats = null;
+      statsError = e;
     }
   }
 
   async function more() {
-    if (!next) return;
-    const list = await api.listAgents(`?after=${next}&limit=100`);
-    agents = [...agents, ...(list.agents || [])];
-    next = list.next_cursor || '';
-  }
-
-  function open(a) { goto(`/agents/${a.id}`); }
-  function fmtBytes(n) {
-    if (!n) return '–';
-    const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-    return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
-  }
-  function relTime(t) {
-    if (!t || t.startsWith('0001')) return '–';
-    const d = (Date.now() - new Date(t).getTime()) / 1000;
-    if (d < 60) return `${d | 0}s`;
-    if (d < 3600) return `${d / 60 | 0}m`;
-    if (d < 86400) return `${d / 3600 | 0}h`;
-    return `${d / 86400 | 0}d`;
-  }
-  function grantsSummary(a) {
-    const fs = Object.keys(a.grants?.fs || {}).map(p => `${p}:${a.grants.fs[p]}`).join(' ');
-    const cmd = (a.grants?.cmd || []).join(',');
-    return [fs, cmd ? `cmd:${cmd}` : ''].filter(Boolean).join(' ');
+    if (!next || loadingMore) return;
+    loadingMore = true;
+    try {
+      const res = await api.listAgents({
+        state: activeState,
+        q: query,
+        after: next,
+        limit: PAGE_SIZE
+      });
+      agents = [...agents, ...(res.agents || [])];
+      next = res.next_cursor || '';
+      loadedCount = agents.length;
+    } catch (e) {
+      toasts.error('Could not load more agents', e, { retry: more });
+    } finally {
+      loadingMore = false;
+    }
   }
 </script>
 
-<section>
-  <h1>Fleet</h1>
+<svelte:head><title>Fleet — Stonewall</title></svelte:head>
 
-  <div class="strip">
-    <div class="stat"><span class="n">{counts.running || 0}</span><span class="l">running</span></div>
-    <div class="stat"><span class="n">{counts.parked || 0}</span><span class="l">parked</span></div>
-    <div class="stat"><span class="n">{(counts.completed || 0) + (counts.failed || 0) + (counts.cancelled || 0)}</span><span class="l">terminal</span></div>
-    <div class="stat"><span class="n">{counts.total || 0}</span><span class="l">total</span></div>
-    <div class="sep"></div>
-    {#if stats}
-      <div class="stat"><span class="n">{stats.cpu_usage_percent.toFixed(0)}%</span><span class="l">cpu</span></div>
-      <div class="stat"><span class="n">{fmtBytes(stats.memory_bytes)}</span><span class="l">mem / {fmtBytes(stats.memory_total_bytes)}</span></div>
-      <div class="stat"><span class="n">{fmtBytes(stats.storage_bytes)}</span><span class="l">disk / {fmtBytes(stats.storage_total_bytes)}</span></div>
-    {:else}
-      <div class="stat muted"><span class="n">–</span><span class="l">node stats unavailable</span></div>
-    {/if}
+<section class="mx-auto flex max-w-[110rem] flex-col gap-4">
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div>
+      <h1 class="text-lg font-semibold tracking-tight">Fleet</h1>
+      <p class="text-muted-foreground text-sm">Open an agent to reach its workbench.</p>
+    </div>
+    <CreateAgentDialog bind:open={createOpen} />
   </div>
 
+  <div class="rounded-lg border p-3">
+    <NodeStatsStrip {counts} {stats} {statsError} />
+  </div>
+
+  <FleetFilters state={activeState} q={query} />
+
   {#if err}
-    <p class="error">⚠ {err.message} {#if err.request_id}<span class="small"> (request {err.request_id})</span>{/if}
-      <button class="btn ghost" onclick={load}>retry</button></p>
+    <ErrorState error={err} retry={load} title="Could not load agents" />
   {:else if loading}
-    <p class="muted">loading…</p>
+    <LoadingState label="Loading agents" rows={6} />
+  {:else if agents.length === 0 && filtered}
+    <EmptyState
+      icon={SearchX}
+      title="No agents match this filter"
+      description="No agent matches the current state filter and search query."
+    >
+      <Button variant="outline" size="sm" href="/">Clear filters</Button>
+    </EmptyState>
+  {:else if agents.length === 0}
+    <EmptyState
+      icon={Bot}
+      title="No agents yet"
+      description="Nothing is running on this node. Create an agent to get started."
+    >
+      <Button size="sm" onclick={() => (createOpen = true)}>New agent</Button>
+    </EmptyState>
   {:else}
-    <table aria-label="agents">
-      <thead>
-        <tr><th>ID</th><th>state</th><th>goal</th><th>image</th><th>grants</th><th>isolation</th><th>model</th><th>act.</th><th>last</th></tr>
-      </thead>
-      <tbody>
-        {#each agents as a (a.id)}
-          <tr class="row" onclick={() => open(a)} tabindex="0"
-              onkeydown={(e) => (e.key === 'Enter' && open(a))}>
-            <td class="code">{a.id}</td>
-            <td><span class="state-pill state-{a.state}">{a.state}</span></td>
-            <td class="small">{(a.goal || '').slice(0, 48)}</td>
-            <td class="small">{a.image}</td>
-            <td class="small muted">{grantsSummary(a)}</td>
-            <td class="small">{a.isolation}</td>
-            <td class="small">{a.model || '–'}</td>
-            <td class="small">{a.activation_count}</td>
-            <td class="small muted">{relTime(a.updated_at)}</td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-    {#if next}<div class="more"><button class="btn ghost" onclick={more}>load more</button></div>{/if}
+    <AgentTable {agents} />
+
+    <div class="flex items-center justify-between gap-3">
+      <p class="text-muted-foreground text-xs">
+        {agents.length} agent{agents.length === 1 ? '' : 's'} loaded{next ? ', more available' : ''}
+      </p>
+      {#if next}
+        <Button variant="outline" size="sm" onclick={more} disabled={loadingMore}>
+          {loadingMore ? 'Loading…' : 'Load more'}
+        </Button>
+      {/if}
+    </div>
   {/if}
 </section>
-
-<style>
-  h1 { margin: 0 0 0.75rem; font-size: 1.1rem; font-weight: 700; }
-  .strip { display: flex; gap: 1.5rem; align-items: baseline; margin-bottom: 1rem; flex-wrap: wrap; }
-  .stat { display: flex; flex-direction: column; }
-  .stat .n { font-weight: 700; font-size: 1.1rem; }
-  .stat .l { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
-  .sep { width: 1px; background: var(--border); align-self: stretch; }
-  .error { color: var(--red); }
-  .more { text-align: center; padding: 0.75rem; }
-  td { max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-</style>
